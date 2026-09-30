@@ -28,6 +28,7 @@ import json
 import os
 import random
 import threading
+from itertools import combinations
 
 from . import chunking, config
 from .auth import AuthManager, PermissionManager
@@ -1683,3 +1684,286 @@ class NameNode:
             paths = [p for p, inode in self.fs.all_files()
                      if bid in inode.get("block_ids", [])]
         return paths
+
+    # ==================================================================
+    # 内容去重分析（去重收益页数据源）
+    # ==================================================================
+    def block_references(self, key, user=None):
+        """
+        块反查：按块 id 或校验和（支持前缀）找出所有引用它的活动文件。
+        key 可以是 blk_xxx / checksum 完整值 / 短前缀（>=6 位）。
+        传入 user 时按路径 ACL 过滤掉无权读取的文件（不泄露路径存在性之外，
+        连路径本身也不返回）。
+        """
+        key = (key or "").strip().lower()
+        with self.meta.lock:
+            blocks = self.meta.get("blocks")["blocks"]
+            bids = []
+            if not key:
+                pass
+            elif key in blocks:                          # 精确块 id
+                bids = [key]
+            else:
+                # 块 id 前缀 / 校验和前缀
+                for bid, blk in blocks.items():
+                    if (bid.lower().startswith(key)
+                            or blk.get("checksum", "").startswith(key)
+                            or blk.get("checksum", "")[:16].lower() == key):
+                        bids.append(bid)
+            bids = sorted(set(bids))
+            files = []
+            for bid in bids:
+                blk = blocks.get(bid)
+                if not blk:
+                    continue
+                refs = []
+                for path, inode in self.fs.all_files():
+                    if user is not None and not self.perms.check(
+                            user, path, "read")["allowed"]:
+                        continue
+                    ids = inode.get("block_ids", [])
+                    indices = [i for i, x in enumerate(ids) if x == bid]
+                    if indices:
+                        refs.append({"path": path,
+                                     "index": indices[0],
+                                     "indices": indices,
+                                     "total_blocks": len(ids),
+                                     "size": inode.get("size", 0)})
+                refs.sort(key=lambda r: r["path"])
+                live = len(self.live_good_replicas(blk))
+                files.append({
+                    "block_id": bid,
+                    "short": short_hash(bid.replace("blk_", ""), 8),
+                    "size": blk.get("size", 0),
+                    "checksum": blk.get("checksum", ""),
+                    "genstamp": blk.get("genstamp"),
+                    "desired": blk.get("desired", config.DEFAULT_REPLICATION),
+                    "live_replicas": live,
+                    "ref_count": len(refs),
+                    "references": refs,
+                    "replicas": [
+                        {"node": nid, "state": r.get("state"),
+                         "live": nid in {n["node_id"] for n in
+                                         self.live_nodes()}}
+                        for nid, r in sorted(
+                            (blk.get("replicas") or {}).items())],
+                })
+            return {"query": key, "blocks": files}
+
+    def dedup_overview(self, user=None):
+        """
+        汇总活动文件系统的内容去重视图（仅活动 inode，不含回收站/历史快照）。
+
+        传入 user 时按路径 ACL 过滤：无权读取的文件不参与统计，避免泄露
+        /finance 等受限目录的路径、大小与共享关系。
+
+        关系判定严格区分两种共享：
+          * 完全相同：文件的块校验和序列（有序、同大小）完全一致；
+          * 部分重叠：只共享部分块，块集合不同（绝不会并入完全相同组）。
+        去重空间口径同时给出"逻辑去重"（唯一内容块）与"物理副本"
+        （唯一块 × 实际存活副本数）两套数字。
+        """
+        with self.meta.lock:
+            blocks_doc = self.meta.get("blocks")
+            blocks = blocks_doc["blocks"]
+            all_entries = self.fs.all_files()
+            # 存活节点集合只取一次（live_good_replicas 内部复用）
+            live_ids = {n["node_id"] for n in self.live_nodes()}
+
+            def can_read(path):
+                return (user is None
+                        or self.perms.check(user, path, "read")["allowed"])
+
+            def good_replicas_locked(blk):
+                n_good = 0
+                for nid, rep in (blk.get("replicas") or {}).items():
+                    if nid not in live_ids:
+                        continue
+                    if rep.get("state") != "ok":
+                        continue
+                    if rep.get("genstamp", 0) != blk.get("genstamp", 0):
+                        continue
+                    n_good += 1
+                return n_good
+
+            # ---- 每文件：有序块/校验和视图 ----
+            files = []
+            ck_info = {}     # checksum -> {size, block_id}
+            for path, inode in all_entries:
+                if not can_read(path):
+                    continue
+                bids = list(inode.get("block_ids", []))
+                seq = []
+                for idx, bid in enumerate(bids):
+                    blk = blocks.get(bid)
+                    ck = blk.get("checksum") if blk else None
+                    live = good_replicas_locked(blk) if blk else 0
+                    seq.append({
+                        "index": idx, "block_id": bid,
+                        "short": short_hash(bid.replace("blk_", ""), 8),
+                        "checksum": ck, "size": blk.get("size", 0) if blk else 0,
+                        "live_replicas": live,
+                        "missing": blk is None,
+                    })
+                    if ck and ck not in ck_info:
+                        ck_info[ck] = {"size": blk.get("size", 0),
+                                       "block_id": bid}
+                files.append({
+                    "path": path, "name": inode.get("name"),
+                    "size": inode.get("size", 0),
+                    "blocks_n": len(bids),
+                    "content_hash": inode.get("content_hash"),
+                    "mime": inode.get("mime", ""),
+                    "owner": inode.get("owner", ""),
+                    "modified_at": inode.get("modified_at"),
+                    "seq": seq,
+                    "cks": tuple(s["checksum"] for s in seq),
+                })
+
+        # ---- 完全相同组：有序校验和序列全等（非空且无缺失块）----
+        exact_groups = {}
+        for f in files:
+            if f["blocks_n"] > 0 and all(c is not None for c in f["cks"]):
+                exact_groups.setdefault(f["cks"], []).append(f["path"])
+        identical_groups = []
+        identical_paths = set()
+        for cks, paths in exact_groups.items():
+            if len(paths) < 2:
+                continue
+            size = sum(ck_info.get(c, {}).get("size", 0) for c in cks)
+            paths.sort()
+            identical_paths.update(paths)
+            identical_groups.append({
+                "key": "g_" + (cks[0] or "")[:12],
+                "paths": paths,
+                "size": size,
+                "blocks_n": len(cks),
+                "saved_bytes": size * (len(paths) - 1),
+            })
+        identical_groups.sort(key=lambda g: -g["saved_bytes"])
+
+        # ---- 块 -> 引用文件（按校验和归并，块 id 已由 by_checksum 去重）----
+        ck_refs = {}
+        for f in files:
+            for s in f["seq"]:
+                ck = s["checksum"]
+                if ck is None:
+                    continue
+                ck_refs.setdefault(ck, set()).add(f["path"])
+
+        # ---- 部分重叠文件对：共享块但块集合不全等 ----
+        cks_sets = {f["path"]: set(f["cks"]) for f in files}
+        pair_map = {}
+        for ck, paths in ck_refs.items():
+            if len(paths) < 2:
+                continue
+            for p1, p2 in combinations(sorted(paths), 2):
+                if cks_sets[p1] == cks_sets[p2]:
+                    continue  # 完全相同的交给 identical_groups
+                key = (p1, p2)
+                ent = pair_map.setdefault(
+                    key, {"a": p1, "b": p2, "shared_checksums": set(),
+                          "shared_bytes": 0})
+                if ck not in ent["shared_checksums"]:
+                    ent["shared_checksums"].add(ck)
+                    ent["shared_bytes"] += ck_info.get(ck, {}).get("size", 0)
+        partial_pairs = []
+        for ent in pair_map.values():
+            a_only = cks_sets[ent["a"]] - ent["shared_checksums"]
+            b_only = cks_sets[ent["b"]] - ent["shared_checksums"]
+            partial_pairs.append({
+                "a": ent["a"], "b": ent["b"],
+                "shared_blocks": len(ent["shared_checksums"]),
+                "shared_bytes": ent["shared_bytes"],
+                "a_only_blocks": len(a_only),
+                "b_only_blocks": len(b_only),
+                "relation": "partial",
+            })
+        partial_pairs.sort(key=lambda p: -p["shared_bytes"])
+        partial_pairs = partial_pairs[:200]
+
+        # ---- 共享块明细（被 >=2 个文件引用的唯一块）----
+        shared_blocks = []
+        for ck, paths in ck_refs.items():
+            if len(paths) < 2:
+                continue
+            info = ck_info.get(ck, {})
+            plist = sorted(paths)
+            shared_blocks.append({
+                "checksum": ck,
+                "short": short_hash(ck, 12),
+                "block_id": info.get("block_id"),
+                "size": info.get("size", 0),
+                "ref_count": len(plist),
+                "paths": plist,
+                "identical_group": len(plist) > 1 and all(
+                    cks_sets[p] == cks_sets[plist[0]] for p in plist[1:]),
+            })
+        shared_blocks.sort(key=lambda b: (-b["ref_count"], -b["size"]))
+
+        # ---- 总量与收益 ----
+        unique_ck = set(ck_info)          # 被活动文件引用的唯一内容块
+        logical_bytes = sum(f["size"] for f in files)
+        logical_refs_bytes = sum(
+            sum(s["size"] for s in f["seq"]) for f in files)
+        unique_bytes = sum(info["size"] for info in ck_info.values())
+        # 物理口径：用块表中实际存活好副本数统计（演示环境通常=desired）
+        physical_refs_bytes = 0
+        physical_unique_bytes = 0
+        counted_unique = set()
+        for f in files:
+            for s in f["seq"]:
+                if s["missing"]:
+                    continue
+                physical_refs_bytes += s["size"] * max(1, s["live_replicas"])
+                if s["checksum"] not in counted_unique:
+                    counted_unique.add(s["checksum"])
+                    physical_unique_bytes += s["size"] * max(
+                        1, s["live_replicas"])
+        shared_ref_bytes = logical_refs_bytes - unique_bytes
+        saved_bytes = shared_ref_bytes
+        saved_physical = physical_refs_bytes - physical_unique_bytes
+        # 引用度分布
+        ref_dist = {}
+        for ck, paths in ck_refs.items():
+            ref_dist[str(len(paths))] = ref_dist.get(str(len(paths)), 0) + 1
+        multi_ref = sum(1 for n in ck_refs.values() if len(n) >= 2)
+
+        # ---- 每文件补充：关系标记 / 自身共享比例 ----
+        for f in files:
+            shared = sum(1 for c in f["cks"] if len(ck_refs.get(c, ())) > 1)
+            f["shared_blocks"] = shared
+            f["unique_blocks"] = f["blocks_n"] - shared
+            f["relation"] = ("identical" if f["path"] in identical_paths
+                             else "partial" if shared else "none")
+            f.pop("cks", None)
+
+        return {
+            "generated_at": now(),
+            "summary": {
+                "files": len(files),
+                "logical_bytes": logical_bytes,
+                "logical_refs_bytes": logical_refs_bytes,
+                "unique_bytes": unique_bytes,
+                "saved_bytes": saved_bytes,
+                "saved_physical_bytes": saved_physical,
+                "dedup_ratio": round(1 - unique_bytes / logical_refs_bytes, 4)
+                if logical_refs_bytes else 0,
+                "dedup_percent": round(
+                    (1 - unique_bytes / logical_refs_bytes) * 100, 2)
+                if logical_refs_bytes else 0,
+                "block_refs": sum(f["blocks_n"] for f in files),
+                "unique_blocks": len(unique_ck),
+                "shared_blocks": multi_ref,
+                "identical_groups": len(identical_groups),
+                "identical_files": len(identical_paths),
+                "partial_pairs": len(pair_map),
+                "physical_refs_bytes": physical_refs_bytes,
+                "physical_unique_bytes": physical_unique_bytes,
+                "ref_dist": ref_dist,
+            },
+            "files": sorted(files, key=lambda f: f["path"]),
+            "identical_groups": identical_groups,
+            "partial_pairs": partial_pairs,
+            "shared_blocks": shared_blocks,
+        }

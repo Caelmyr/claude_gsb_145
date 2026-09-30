@@ -654,6 +654,18 @@ def api_stats_timeline(ctx):
     return ctx.nn.timeline_stats(hours)
 
 
+@route("GET", "/api/dedup/overview")
+def api_dedup_overview(ctx):
+    """内容去重收益视图：完全相同组 / 部分重叠对 / 共享块 / 空间收益。"""
+    return ctx.nn.dedup_overview(ctx.user)
+
+
+@route("GET", "/api/dedup/block_refs")
+def api_dedup_block_refs(ctx):
+    """块反查：按块 id / 校验和（支持前缀）列出所有引用它的文件。"""
+    return ctx.nn.block_references(ctx.query.get("q", ""), ctx.user)
+
+
 # ============================================================================
 # API: 用户管理
 # ============================================================================

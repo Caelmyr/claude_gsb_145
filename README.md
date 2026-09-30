@@ -10,7 +10,7 @@
 纯 Python（标准库，零第三方依赖）+ 原生 HTML/CSS/JS 实现的**教学级分布式文件系统**：
 模拟 HDFS 风格的 NameNode / DataNode 集群（节点间全 HTTP 通信），
 在其上叠加 Git 风格的版本控制（提交 / 分支 / 三方合并 / 检出），
-并提供 11 个页面的管理控制台。
+并提供 12 个页面的管理控制台。
 
 代码规模：**约 12,000 行**（后端 ~8,700 行 Python，前端 ~4,400 行 HTML/CSS/JS）。
 
@@ -43,7 +43,7 @@ python3 -m backend.datanode --id dn5 --port 8025
 
 ---
 
-## 2. 前端页面（11 个，要求 10 个 + 仪表盘）
+## 2. 前端页面（12 个，要求 10 个 + 仪表盘）
 
 | 页面 | 文件 | 内容 |
 |---|---|---|
@@ -53,6 +53,7 @@ python3 -m backend.datanode --id dn5 --port 8025
 | 版本历史 | `versions.html` | 提交时间线（泳道）、分支管理、提交/合并/检出、冲突展示、文件级历史与回滚 |
 | 差异对比 | `diff.html` | 版本 diff + 文本 diff 双模式、Myers/Patience/difflib 选择、unified/双栏视图、行内字符级高亮、大文件性能试验台 |
 | 节点状态 | `nodes.html` | 节点卡片（心跳/容量/IO/版本向量）、块×节点副本矩阵、恢复队列、杀死/复活/注入损坏演练、实时事件流 |
+| 内容去重 | `dedup.html` | 去重收益 KPI（逻辑/含副本双口径）、完全相同组与部分重叠对（严格区分）、文件↔共享块关系图、块→文件反查、再补一份备份的代价评估 |
 | 存储统计 | `stats.html` | 容量 donut、副本数分布、块大小直方图、24h 吞吐、容量趋势、类型分布、热度榜（sparkline）、元数据文档表 |
 | 用户管理 | `users.html` | 用户 CRUD、角色能力矩阵、活动会话与吊销 |
 | 权限设置 | `permissions.html` | 路径前缀 ACL 规则编辑器、默认策略、**判定轨迹测试器** |
@@ -67,7 +68,7 @@ python3 -m backend.datanode --id dn5 --port 8025
 ## 3. 架构
 
 ```
-┌──────────────────────────── 浏览器（11 页面）────────────────────────────┐
+┌──────────────────────────── 浏览器（12 页面）────────────────────────────┐
 │  fetch /api/*（JSON）· /api/download（Range）· /api/thumbnail           │
 └───────────────────────────────────┬──────────────────────────────────────┘
                                     │ HTTP（Bearer 令牌 + 路径 ACL）
@@ -175,6 +176,7 @@ GET  /api/nodes|nodes/blocks|nodes/matrix|nodes/block_paths
 GET  /api/health/queue           GET /api/sim/events
 POST /api/sim/kill|revive|corrupt|chaos                （admin）
 GET  /api/stats/overview|hotness|timeline
+GET  /api/dedup/overview|dedup/block_refs    （内容去重收益 / 块→文件反查，按路径 ACL 过滤）
 GET|POST /api/users  PUT|DELETE /api/users/<name>      （user_admin）
 GET|POST /api/perms  PUT|DELETE /api/perms/<id>        （perm_admin）
 POST /api/perms/check
@@ -204,7 +206,7 @@ gsb4/
 │   ├── http_server.py         # 路由 + 静态页 + 鉴权中间件
 │   ├── seed.py                # 演示数据（含冲突合并场景）
 │   └── main.py                # 集群装配
-├── frontend/                  # 11 页面 + css/app.css + js/app.js
+├── frontend/                  # 12 页面 + css/app.css + js/app.js
 └── tests/smoke_test.py        # 97 项端到端断言
 ```
 

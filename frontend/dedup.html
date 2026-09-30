@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>内容去重 · DFSVS</title>
+<link rel="stylesheet" href="css/app.css">
+<style>
+  /* ---------------------------------------------------------------- 去重页局部样式 */
+  .dd-rel { display:inline-flex; align-items:center; gap:5px; font-size:11.5px;
+           padding:2px 8px; border-radius:11px; border:1px solid var(--border);
+           white-space:nowrap; }
+  .dd-rel.exact { color:#2fbf71; background:rgba(47,191,113,.10); border-color:rgba(47,191,113,.35); }
+  .dd-rel.partial { color:#f0a538; background:rgba(240,165,58,.10); border-color:rgba(240,165,58,.35); }
+  .dd-rel.none { color:var(--muted); background:rgba(111,120,144,.08); }
+  .dd-rel::before { content:""; width:7px; height:7px; border-radius:50%; background:currentColor; }
+  .dd-grp-tag { display:inline-block; font-size:11px; padding:1px 7px; border-radius:9px;
+               background:rgba(155,108,255,.13); color:#b78cff; border:1px solid rgba(155,108,255,.35);
+               margin-right:6px; cursor:pointer; }
+  .dd-grp-tag:hover { filter:brightness(1.3); }
+  .blk-cell { display:inline-flex; align-items:center; justify-content:center;
+             width:22px; height:15px; border-radius:3px; margin:1px;
+             background:#1c2436; border:1px solid var(--border-soft);
+             font-size:9.5px; color:var(--muted); font-family:var(--mono); cursor:default; }
+  .blk-cell.shared { background:rgba(47,191,113,.55); border-color:#2fbf71; color:#04160b; }
+  .blk-cell.exact { background:#2fbf71; border-color:#2fbf71; color:#04160b; }
+  .blk-cell:hover { outline:1.5px solid var(--accent); }
+  .blk-strip { line-height:0; max-width:340px; white-space:normal; }
+  .file-link { color:var(--text); text-decoration:none; cursor:pointer; }
+  .file-link:hover { color:var(--accent); text-decoration:underline; }
+  .node-file rect { fill:#141b2a; stroke:var(--border); stroke-width:1.2; cursor:pointer; }
+  .node-file:hover rect { stroke:var(--accent); }
+  .node-file.exact rect { stroke:rgba(47,191,113,.65); }
+  .node-file.partial rect { stroke:rgba(240,165,58,.65); }
+  .node-block rect { fill:#1c2436; stroke:var(--border-soft); cursor:pointer; }
+  .node-block.shared rect { fill:rgba(47,191,113,.22); stroke:rgba(47,191,113,.6); }
+  .node-block rect:hover { stroke:var(--accent); }
+  .edge { stroke:#3a4460; stroke-width:1.3; opacity:.55; }
+  .edge.exact { stroke:#2fbf71; opacity:.75; }
+  .edge.partial { stroke:#f0a538; opacity:.7; stroke-dasharray:4 3; }
+  .edge.hl { stroke:var(--accent); stroke-width:2.6; opacity:1; }
+  .dimmed { opacity:.12; }
+  .grp-box { fill:rgba(155,108,255,.05); stroke:rgba(155,108,255,.35);
+            stroke-dasharray:6 4; rx:10; }
+  .grp-label { fill:#b78cff; font-size:11px; }
+  .dd-search input { background:var(--bg); border:1px solid var(--border);
+                    color:var(--text); border-radius:7px; padding:7px 11px;
+                    font-family:var(--mono); font-size:12.5px; width:340px; }
+  .dd-search input:focus { outline:none; border-color:var(--accent); }
+  .cost-pick { font-size:12.5px; color:var(--muted); }
+  .cost-pick select { background:var(--bg); border:1px solid var(--border); color:var(--text);
+                     border-radius:6px; padding:3px 7px; margin:0 5px; }
+  .sav-big { font-size:15px; font-weight:700; color:var(--ok); font-family:var(--mono); }
+  .rel-a-b b { font-family:var(--mono); font-weight:600; }
+  details.dd-files { margin-top:6px; }
+  details.dd-files summary { cursor:pointer; font-size:12px; color:var(--muted); }
+  .ref-pos { font-family:var(--mono); font-size:11.5px; color:var(--muted); }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside id="sidebar" class="sidebar"></aside>
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <h1 id="page-title">内容去重</h1>
+        <div class="sub" id="page-sub">相同内容共享数据块 · 去重节省空间 · 块↔文件双向反查 · 再补一份备份的代价</div>
+      </div>
+      <div class="spacer"></div>
+      <div class="userchip" id="userchip"></div>
+    </header>
+
+    <section class="content">
+      <!-- KPI -->
+      <div class="grid cols-5" id="kpi-row" style="margin-bottom:16px"></div>
+
+      <!-- 再补一份备份的代价 -->
+      <div class="card">
+        <div class="card-title">再补一份备份要花多少代价？
+          <span class="hint">所有文件都已按内容校验和去重：再写入一份完全相同的数据时，只会增加引用、不会产生任何新块</span></div>
+        <div style="display:flex;gap:26px;align-items:center;flex-wrap:wrap">
+          <div style="min-width:230px">
+            <div class="cost-pick" style="margin-bottom:10px">
+              备份对象
+              <select id="cost-scope">
+                <option value="all">整个活动文件系统（全部文件）</option>
+              </select>
+              额外副本因子
+              <select id="cost-factor">
+                <option value="1">1×（仅块本体）</option>
+                <option value="3" selected>3×（默认三副本）</option>
+              </select>
+            </div>
+            <div id="cost-note" class="small muted"></div>
+          </div>
+          <div style="display:flex;gap:14px;flex-wrap:wrap;flex:1;min-width:420px" id="cost-cards"></div>
+        </div>
+        <hr class="hr">
+        <div id="cap-bar"></div>
+      </div>
+
+      <!-- 视图切换 -->
+      <div class="tabs">
+        <a class="tab active" data-tab="list" href="javascript:void(0)">① 列表视图</a>
+        <a class="tab" data-tab="graph" href="javascript:void(0)">② 关系视图</a>
+        <a class="tab" data-tab="blocks" href="javascript:void(0)">③ 共享块反查</a>
+      </div>
+
+      <!-- ================= 列表视图 ================= -->
+      <div id="tab-list">
+        <div class="card">
+          <div class="card-title">完全相同的文件组
+            <span class="hint">判定标准：有序块校验和序列逐块一致且文件大小相同 —— 只共享部分块的文件不会出现在这里</span>
+          </div>
+          <div class="table-wrap"><table class="tbl">
+            <thead><tr><th>组</th><th>文件（逐字节相同）</th><th class="right">单份大小</th>
+              <th class="right">份数</th><th class="right">共享块</th><th class="right">去重节省</th></tr></thead>
+            <tbody id="exact-body"></tbody>
+          </table></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">部分重叠的文件对
+            <span class="hint">只共享部分数据块、块集合不全等 —— 明确标注为「部分重叠」，与「完全相同」严格区分</span>
+          </div>
+          <div class="table-wrap"><table class="tbl">
+            <thead><tr><th>关系</th><th>文件 A</th><th>文件 B</th>
+              <th class="right">共享块</th><th class="right">仅 A 有</th><th class="right">仅 B 有</th>
+              <th class="right">共享字节</th><th></th></tr></thead>
+            <tbody id="partial-body"></tbody>
+          </table></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">全部文件与块共享情况
+            <span class="hint">每个色块代表一个数据块：绿色=被多个文件共享，深色=仅本文件引用；悬停可看块号</span>
+          </div>
+          <div class="table-wrap"><table class="tbl">
+            <thead><tr><th>关系</th><th>文件路径</th><th class="right">大小</th>
+              <th class="right">块数</th><th class="right">共享块</th>
+              <th>块序列（共享块标绿）</th><th class="right">去重命中</th></tr></thead>
+            <tbody id="files-body"></tbody>
+          </table></div>
+        </div>
+      </div>
+
+      <!-- ================= 关系视图 ================= -->
+      <div id="tab-graph" style="display:none">
+        <div class="card">
+          <div class="card-title">文件 ↔ 共享块 关系图
+            <span class="hint">实线绿边=完全相同组内共享；橙色虚线=部分重叠；点击文件或块可反查/高亮</span>
+            <span class="spacer"></span>
+            <label class="small muted"><input type="checkbox" id="graph-only-shared" checked> 仅显示参与共享的文件</label>
+          </div>
+          <div id="graph-legend" style="margin-bottom:8px"></div>
+          <div id="graph-box" style="overflow:auto;border:1px solid var(--border-soft);border-radius:8px;background:var(--bg)"></div>
+          <div class="small muted" style="margin-top:8px">
+            紫框 = 完全相同组（组内文件的块序列完全一致）；一个共享块节点只画一次，被多少文件引用就有多少条边。
+          </div>
+        </div>
+      </div>
+
+      <!-- ================= 块反查 ================= -->
+      <div id="tab-blocks" style="display:none">
+        <div class="card">
+          <div class="card-title">从数据块反查引用它的文件
+            <span class="hint">输入块 ID（blk_…）或 sha256 校验和，支持不少于 6 位的前缀匹配</span>
+          </div>
+          <div class="dd-search" style="margin-bottom:12px">
+            <input id="blk-q" placeholder="例如 blk_83c101 或 83c10149c2…" autocomplete="off">
+            <button class="btn primary sm" id="blk-go">反查</button>
+            <span id="blk-qhint" class="small muted" style="margin-left:10px"></span>
+          </div>
+          <div id="blk-result"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">所有共享块（被 ≥2 个文件引用）
+            <span class="hint">这就是「一份数据多处引用」的完整清单，点击任意行可填入上方反查框</span>
+          </div>
+          <div class="table-wrap"><table class="tbl">
+            <thead><tr><th>#</th><th>数据块</th><th>校验和前缀</th><th class="right">大小</th>
+              <th class="right">引用数</th><th>关系</th><th>引用该块的文件</th></tr></thead>
+            <tbody id="shared-body"></tbody>
+          </table></div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+<div id="toasts"></div>
+<script src="js/app.js"></script>
+<script>
+"use strict";
+const { api, esc, fmtBytes, fmtTs, toast, legend, PALETTE } = DFSVS;
+
+let DATA = null;
+let curTab = "list";
+
+async function load() {
+  DATA = await api("GET", "/api/dedup/overview");
+  renderKpis(DATA);
+  renderCost(DATA);
+  renderExact(DATA);
+  renderPartial(DATA);
+  renderFiles(DATA);
+  renderSharedTable(DATA);
+  renderGraph(DATA);
+}
+
+/* ================================================================ KPI */
+function pct(x) { return (x * 100).toFixed(1) + "%"; }
+
+function renderKpis(d) {
+  const s = d.summary;
+  const ratio = s.dedup_percent / 100;
+  const cells = [
+    { label: "逻辑数据（文件求和）", value: fmtBytes(s.logical_bytes),
+      sub: `${s.files} 个文件 · ${s.block_refs} 次块引用`, cls: "accent" },
+    { label: "去重后唯一内容", value: fmtBytes(s.unique_bytes),
+      sub: `${s.unique_blocks} 个唯一数据块`, cls: "" },
+    { label: "去重节省（逻辑口径）", value: fmtBytes(s.saved_bytes),
+      sub: `占逻辑数据 ${s.dedup_percent}%`, cls: "ok" },
+    { label: "去重节省（含副本）", value: fmtBytes(s.saved_physical_bytes),
+      sub: `实际物理占用 ${fmtBytes(s.physical_refs_bytes)}`, cls: "ok" },
+    { label: "完全相同 / 部分重叠",
+      value: `${s.identical_groups} 组`,
+      sub: `${s.identical_files} 个完全相同文件 · ${s.partial_pairs} 对部分重叠`,
+      cls: ratio > 0 ? "warn" : "" },
+  ];
+  document.getElementById("kpi-row").innerHTML = cells.map(c => `
+    <div class="kpi ${c.cls}">
+      <div class="k-label">${esc(c.label)}</div>
+      <div class="k-value">${esc(c.value)}</div>
+      <div class="k-sub">${esc(c.sub)}</div>
+    </div>`).join("");
+}
+
+/* ====================================================== 再补一份备份 */
+function renderCost(d) {
+  const sel = document.getElementById("cost-scope");
+  // 追加「单个完全相同组」选项
+  d.identical_groups.forEach((g, i) =>
+    sel.add(new Option(`仅备份「${g.paths[0]}」的相同副本组（${g.paths.length} 份）`, "g" + i)));
+  const factorEl = document.getElementById("cost-factor");
+  const note = document.getElementById("cost-note");
+
+  function update() {
+    const factor = parseInt(factorEl.value, 10);
+    const scope = sel.value;
+    let naive, uniqueNew, filesN, label;
+    if (scope === "all") {
+      // 再补一份"与当前完全一致"的全量备份
+      naive = d.summary.logical_refs_bytes;
+      // 每个唯一内容块都已存在 -> 新写入块为 0（完全命中去重）
+      uniqueNew = 0;
+      filesN = d.summary.files;
+      label = "当前活动文件系统中的全部文件";
+    } else {
+      const g = d.identical_groups[parseInt(scope.slice(1), 10)];
+      // 模拟"再复制一份该组内容"：朴素做法=1 份大小；去重后新增=0
+      naive = g.size; uniqueNew = 0; filesN = 1;
+      label = g.paths[0];
+    }
+    const saved = naive - uniqueNew;
+    const ratio = naive ? saved / naive : 0;
+    document.getElementById("cost-cards").innerHTML = [
+      { t: "朴素复制（不去重）", v: naive * factor, c: "var(--bad)",
+        s: `新增 ${filesN} 个文件需传输/落盘的逻辑字节 × ${factor} 副本` },
+      { t: "内容去重后实际新增", v: uniqueNew * factor, c: "var(--ok)",
+        s: uniqueNew === 0 ? "全部块已存在，0 新块、0 传输，仅增加引用计数"
+                           : `新增唯一块字节 × ${factor} 副本` },
+      { t: "节省的备份代价", v: saved * factor, c: "var(--accent)",
+        s: `相当于朴素方案的 ${pct(ratio)}` },
+    ].map(x => `
+      <div style="flex:1;min-width:200px;background:var(--bg);border:1px solid var(--border);
+                  border-radius:9px;padding:12px 14px">
+        <div class="small muted">${esc(x.t)}</div>
+        <div style="font-size:21px;font-weight:700;font-family:var(--mono);color:${x.c};margin:3px 0">
+          ${fmtBytes(x.v)}</div>
+        <div class="small muted">${esc(x.s)}</div>
+      </div>`).join("");
+    note.textContent = `评估对象：${label}；副本因子 ${factor}×。` +
+      (uniqueNew === 0
+        ? " 再补一份逐字节相同的备份时，所有块均命中校验和索引，物理上不新增任何数据块。"
+        : "");
+    // 容量条：朴素 vs 去重
+    const w = Math.max(2, (1 - ratio) * 100);
+    document.getElementById("cap-bar").innerHTML = `
+      <div class="small muted" style="margin-bottom:5px">
+        备份写入量对比（${fmtBytes(naive * factor)} → <b class="sav-big">${fmtBytes(uniqueNew * factor)}</b>，
+        减少 ${pct(ratio)}）</div>
+      <div class="pbar" style="height:14px"><i style="width:100%;background:linear-gradient(90deg,#b03a34,#e5534b)"></i></div>
+      <div class="pbar ok" style="height:14px;margin-top:5px"><i style="width:${w}%"></i></div>`;
+  }
+  sel.onchange = update; factorEl.onchange = update;
+  update();
+}
+
+/* ========================================================== 关系徽章 */
+function relBadge(rel) {
+  if (rel === "identical")
+    return `<span class="dd-rel exact" title="有序块序列完全一致，文件逐字节相同">完全相同</span>`;
+  if (rel === "partial")
+    return `<span class="dd-rel partial" title="仅部分数据块相同，文件并不相同">部分重叠</span>`;
+  return `<span class="dd-rel none" title="没有与任何其他文件共享数据块">独立</span>`;
+}
+
+/* ========================================================== 完全相同 */
+function renderExact(d) {
+  const body = document.getElementById("exact-body");
+  if (!d.identical_groups.length) {
+    body.innerHTML = `<tr><td colspan="6" class="empty small">当前没有逐字节完全相同的文件</td></tr>`;
+    return;
+  }
+  body.innerHTML = d.identical_groups.map((g, i) => `
+    <tr>
+      <td><span class="dd-grp-tag" data-grp="${i}" title="在关系视图中高亮该组">组 ${String(i + 1).padStart(2, "0")}</span></td>
+      <td class="small">
+        ${g.paths.map((p, j) => `${j ? "<br>" : ""}<a class="file-link" data-path="${esc(p)}">${esc(p)}</a>`).join("")}
+      </td>
+      <td class="num right">${fmtBytes(g.size)}</td>
+      <td class="num right"><b>${g.paths.length}</b></td>
+      <td class="num right">${g.blocks_n}</td>
+      <td class="num right"><b style="color:var(--ok)">${fmtBytes(g.saved_bytes)}</b></td>
+    </tr>`).join("");
+  body.querySelectorAll("[data-path]").forEach(a =>
+    a.onclick = () => showFileModal(a.dataset.path));
+  body.querySelectorAll("[data-grp]").forEach(t =>
+    t.onclick = () => { switchTab("graph"); highlightGroup(parseInt(t.dataset.grp, 10)); });
+}
+
+/* ========================================================== 部分重叠 */
+function renderPartial(d) {
+  const body = document.getElementById("partial-body");
+  if (!d.partial_pairs.length) {
+    body.innerHTML = `<tr><td colspan="8" class="empty small">当前没有部分重叠的文件对</td></tr>`;
+    return;
+  }
+  body.innerHTML = d.partial_pairs.map(p => `
+    <tr class="rel-a-b">
+      <td>${relBadge("partial")}</td>
+      <td><a class="file-link" data-path="${esc(p.a)}">${esc(p.a)}</a></td>
+      <td><a class="file-link" data-path="${esc(p.b)}">${esc(p.b)}</a></td>
+      <td class="num right"><b style="color:var(--warn)">${p.shared_blocks}</b></td>
+      <td class="num right">${p.a_only_blocks}</td>
+      <td class="num right">${p.b_only_blocks}</td>
+      <td class="num right">${fmtBytes(p.shared_bytes)}</td>
+      <td><button class="btn xs ghost" data-pa="${esc(p.a)}" data-pb="${esc(p.b)}">关系图</button></td>
+    </tr>`).join("");
+  body.querySelectorAll("[data-path]").forEach(a =>
+    a.onclick = () => showFileModal(a.dataset.path));
+  body.querySelectorAll("[data-pa]").forEach(b =>
+    b.onclick = () => { switchTab("graph"); highlightPair(b.dataset.pa, b.dataset.pb); });
+}
+
+/* ========================================================== 文件总表 */
+function sharedChecksums(d) {
+  return new Set(d.shared_blocks.map(b => b.checksum));
+}
+
+function renderFiles(d) {
+  const shared = sharedChecksums(d);
+  const body = document.getElementById("files-body");
+  body.innerHTML = d.files.map((f) => {
+    const strip = f.seq.map(s => {
+      const isShared = shared.has(s.checksum);
+      const cls = isShared ? (f.relation === "identical" ? "exact" : "shared") : "";
+      const title = `#${s.index} ${s.short} · ${fmtBytes(s.size)} · ` +
+        (isShared ? "多文件共享" : "仅此文件引用");
+      return `<span class="blk-cell ${cls}" title="${esc(title)}">${s.index}</span>`;
+    }).join("");
+    return `
+    <tr>
+      <td>${relBadge(f.relation)}</td>
+      <td><a class="file-link" data-path="${esc(f.path)}">${esc(f.path)}</a></td>
+      <td class="num right">${fmtBytes(f.size)}</td>
+      <td class="num right">${f.blocks_n}</td>
+      <td class="num right">${f.shared_blocks
+        ? `<b style="color:var(--ok)">${f.shared_blocks}</b>` : "0"}</td>
+      <td><div class="blk-strip">${strip}</div></td>
+      <td class="num right">${f.blocks_n
+        ? pct(f.shared_blocks / f.blocks_n) : "—"}</td>
+    </tr>`;
+  }).join("");
+  body.querySelectorAll("[data-path]").forEach(a =>
+    a.onclick = () => showFileModal(a.dataset.path));
+}
+
+/* ========================================================== 文件弹窗（块明细）*/
+function showFileModal(path) {
+  const f = DATA.files.find(x => x.path === path);
+  if (!f) return;
+  const shared = sharedChecksums(DATA);
+  DFSVS.modal({
+    title: "文件块明细",
+    wide: true,
+    hideCancel: true, okText: "关闭",
+    body: `
+      <div style="margin-bottom:10px">
+        <div class="mono" style="font-size:13.5px;margin-bottom:4px">${esc(f.path)}</div>
+        <div class="small muted">${fmtBytes(f.size)} · ${f.blocks_n} 个块 ·
+          关系：${f.relation === "identical" ? "完全相同副本之一"
+                 : f.relation === "partial" ? "与其他文件部分重叠" : "独立（无共享块）"}</div>
+      </div>
+      <div class="table-wrap"><table class="tbl">
+        <thead><tr><th class="right">#</th><th>块 ID</th><th>校验和前缀</th>
+          <th class="right">大小</th><th class="right">存活副本</th><th>共享</th><th>同块文件</th></tr></thead>
+        <tbody>${f.seq.map(s => {
+          const sb = DATA.shared_blocks.find(b => b.checksum === s.checksum);
+          return `<tr>
+            <td class="num right">${s.index}</td>
+            <td class="mono small">${esc(s.short)}</td>
+            <td class="mono small muted">${esc((s.checksum || "").slice(0, 12))}</td>
+            <td class="num right">${fmtBytes(s.size)}</td>
+            <td class="num right">${s.missing ? "—" : `${s.live_replicas}/3`}</td>
+            <td>${sb ? `<span class="dd-rel exact" style="cursor:pointer" data-bq="${esc(s.block_id)}">${sb.ref_count} 文件</span>`
+                     : `<span class="dd-rel none">独有</span>`}</td>
+            <td class="small">${sb ? sb.paths.filter(p => p !== path).map(p =>
+              `<a class="file-link" data-p2="${esc(p)}">${esc(p)}</a>`).join("，") : "—"}</td>
+          </tr>`;
+        }).join("")}</tbody></table></div>`,
+  });
+  setTimeout(() => {
+    document.querySelectorAll(".modal [data-bq]").forEach(el =>
+      el.onclick = () => {
+        document.querySelector(".modal-mask")?.remove();
+        switchTab("blocks"); lookupBlock(el.dataset.bq);
+      });
+    document.querySelectorAll(".modal [data-p2]").forEach(el =>
+      el.onclick = () => {
+        const p = el.dataset.p2;
+        document.querySelector(".modal-mask")?.remove();
+        showFileModal(p);
+      });
+  }, 0);
+}
+
+/* ========================================================== 关系视图（SVG）*/
+function renderGraph(d) {
+  const box = document.getElementById("graph-box");
+  const onlyShared = document.getElementById("graph-only-shared").checked;
+  const sharedCks = d.shared_blocks.map(b => b.checksum);
+  const ckBlock = {};
+  d.shared_blocks.forEach(b => { ckBlock[b.checksum] = b; });
+
+  // 参与共享的文件集合
+  const sharedPaths = new Set();
+  d.shared_blocks.forEach(b => b.paths.forEach(p => sharedPaths.add(p)));
+  const files = d.files.filter(f => !onlyShared || sharedPaths.has(f.path));
+  const pathIdx = Object.fromEntries(files.map((f, i) => [f.path, i]));
+
+  // 布局：左列文件（按完全相同组聚拢），右列共享块
+  const groupOf = {};
+  d.identical_groups.forEach((g, i) => g.paths.forEach(p => { groupOf[p] = i; }));
+  const ordered = files.slice().sort((a, b) => {
+    const ga = groupOf[a.path] ?? -1, gb = groupOf[b.path] ?? -1;
+    if (ga !== gb) return (ga === -1 ? 999 : ga) - (gb === -1 ? 999 : gb);
+    return a.path.localeCompare(b.path);
+  });
+  const rowH = 30, padTop = 26, padLeft = 18;
+  const fileX = padLeft, blockX = 560;
+  const fileW = 400, fileH = 22;
+  const maxBlocks = sharedCks.length;
+  const blocksShown = d.shared_blocks;
+  const H = Math.max(ordered.length, maxBlocks) * rowH + padTop + 30;
+  const W = blockX + 360;
+  const pos = {};
+  ordered.forEach((f, i) => { pos[f.path] = padTop + i * rowH; });
+  blocksShown.forEach((b, i) => { pos["b" + b.checksum] = padTop + i * rowH; });
+
+  // 完全相同组背景框
+  let boxes = "";
+  d.identical_groups.forEach((g, i) => {
+    const rows = g.paths.filter(p => pos[p] !== undefined).map(p => pos[p]);
+    if (!rows.length) return;
+    const y = Math.min(...rows) - 8, h = (Math.max(...rows) - Math.min(...rows)) + fileH + 14;
+    boxes += `<rect class="grp-box" x="${fileX - 8}" y="${y}" width="${fileW + 290}" height="${h}"/>
+              <text class="grp-label" x="${fileX}" y="${y - 3}">完全相同组 ${i + 1}（${g.paths.length} 份 · 节省 ${fmtBytes(g.saved_bytes)}）</text>`;
+  });
+
+  // 边：文件 -> 它引用到的共享块
+  let edges = "";
+  ordered.forEach(f => {
+    const exactSet = new Set(
+      (d.identical_groups[groupOf[f.path]] || { paths: [] }).paths);
+    f.seq.forEach(s => {
+      const b = ckBlock[s.checksum];
+      if (!b || pos["b" + s.checksum] === undefined) return;
+      const y1 = pos[f.path] + fileH / 2;
+      const y2 = pos["b" + s.checksum] + 9;
+      // 同属一个完全相同组 -> 绿实线，否则橙虚线
+      const sameExact = b.paths.every(p => exactSet.has(p)) && f.path in groupOf;
+      const cls = sameExact ? "edge exact" : "edge partial";
+      edges += `<path class="${cls}" data-a="${esc(f.path)}" data-b="${esc(s.checksum)}"
+                 d="M${fileX + fileW},${y1} C${fileX + 470},${y1} ${blockX - 60},${y2} ${blockX},${y2}"/>`;
+    });
+  });
+
+  const fileNodes = ordered.map(f => {
+    const y = pos[f.path];
+    const cls = "node-file " + (f.relation === "identical" ? "exact"
+                              : f.relation === "partial" ? "partial" : "");
+    const tag = f.relation === "identical" ? "⧉" : f.relation === "partial" ? "◔" : "·";
+    return `<g class="${cls}" data-path="${esc(f.path)}">
+      <rect x="${fileX}" y="${y}" width="${fileW}" height="${fileH}" rx="6"/>
+      <text x="${fileX + 10}" y="${y + 15}" style="font-size:12px;fill:var(--text)">
+        ${tag} ${esc(f.path)}</text>
+      <text x="${fileX + fileW - 10}" y="${y + 15}" text-anchor="end"
+        style="font-size:11px;fill:var(--muted)">${f.shared_blocks}/${f.blocks_n} 块共享</text>
+    </g>`;
+  }).join("");
+
+  const blockNodes = blocksShown.map(b => {
+    const y = pos["b" + b.checksum];
+    return `<g class="node-block shared" data-bid="${esc(b.block_id)}" data-ck="${esc(b.checksum)}">
+      <rect x="${blockX}" y="${y}" width="330" height="18" rx="5"/>
+      <text x="${blockX + 9}" y="${y + 13}" style="font-size:10.5px;fill:var(--text)">
+        ${esc(b.short)} · ${fmtBytes(b.size)} · ${b.ref_count} 引用</text>
+    </g>`;
+  }).join("");
+
+  box.innerHTML = `
+    <svg width="${Math.max(W, 920)}" height="${Math.max(H, 160)}" viewBox="0 0 ${W} ${H}"
+         style="min-width:920px;display:block">
+      ${boxes}${edges}${fileNodes}${blockNodes}
+    </svg>`;
+
+  document.getElementById("graph-legend").innerHTML = legend([
+    { label: "完全相同：组内块序列逐块一致", color: "#2fbf71" },
+    { label: "部分重叠：仅共享部分块（虚线）", color: "#f0a538" },
+  ]);
+
+  // ---- 交互：点文件 -> 弹窗；点块 -> 反查；悬停高亮 ----
+  box.querySelectorAll(".node-file").forEach(g => g.onclick = () => showFileModal(g.dataset.path));
+  box.querySelectorAll(".node-block").forEach(g =>
+    g.onclick = () => { switchTab("blocks"); lookupBlock(g.dataset.bid); });
+  box.querySelectorAll(".node-file").forEach(g => {
+    g.addEventListener("mouseenter", () => dimByFile(g.dataset.path));
+    g.addEventListener("mouseleave", clearDim);
+  });
+  box.querySelectorAll(".node-block").forEach(g => {
+    g.addEventListener("mouseenter", () => dimByBlock(g.dataset.ck));
+    g.addEventListener("mouseleave", clearDim);
+  });
+
+  function dimByFile(path) {
+    box.querySelectorAll(".edge").forEach(e =>
+      e.classList.toggle("hl", e.dataset.a === path));
+    const cks = new Set((d.files.find(f => f.path === path) || { seq: [] })
+      .seq.map(s => s.checksum));
+    box.querySelectorAll(".node-block").forEach(n =>
+      n.classList.toggle("dimmed", !cks.has(n.dataset.ck)));
+    box.querySelectorAll(".node-file").forEach(n =>
+      n.classList.toggle("dimmed", n.dataset.path !== path));
+  }
+  function dimByBlock(ck) {
+    const paths = new Set((ckBlock[ck] || { paths: [] }).paths);
+    box.querySelectorAll(".edge").forEach(e =>
+      e.classList.toggle("hl", e.dataset.b === ck));
+    box.querySelectorAll(".node-file").forEach(n =>
+      n.classList.toggle("dimmed", !paths.has(n.dataset.path)));
+    box.querySelectorAll(".node-block").forEach(n =>
+      n.classList.toggle("dimmed", n.dataset.ck !== ck));
+  }
+  function clearDim() {
+    box.querySelectorAll(".dimmed,.edge.hl").forEach(e =>
+      e.classList.remove("dimmed", "hl"));
+  }
+}
+
+function highlightGroup(i) {
+  const g = DATA.identical_groups[i];
+  if (!g) return;
+  // 滚到关系图并用第一条边高亮整组
+  document.getElementById("graph-box").scrollIntoView({ behavior: "smooth", block: "center" });
+  const box = document.getElementById("graph-box");
+  box.querySelectorAll(".edge").forEach(e =>
+    e.classList.toggle("hl", g.paths.includes(e.dataset.a)));
+  box.querySelectorAll(".node-file").forEach(n =>
+    n.classList.toggle("dimmed", !g.paths.includes(n.dataset.path)));
+  box.querySelectorAll(".node-block").forEach(n => {
+    const b = DATA.shared_blocks.find(x => x.checksum === n.dataset.ck);
+    n.classList.toggle("dimmed", !(b && b.paths.every(p => g.paths.includes(p))));
+  });
+}
+
+function highlightPair(a, b) {
+  document.getElementById("graph-box").scrollIntoView({ behavior: "smooth", block: "center" });
+  const box = document.getElementById("graph-box");
+  const pair = new Set([a, b]);
+  box.querySelectorAll(".edge").forEach(e =>
+    e.classList.toggle("hl", pair.has(e.dataset.a)));
+  box.querySelectorAll(".node-file").forEach(n =>
+    n.classList.toggle("dimmed", !pair.has(n.dataset.path)));
+  box.querySelectorAll(".node-block").forEach(n => {
+    const blk = DATA.shared_blocks.find(x => x.checksum === n.dataset.ck);
+    n.classList.toggle("dimmed", !(blk && blk.paths.includes(a) && blk.paths.includes(b)));
+  });
+}
+
+/* ========================================================== 共享块表 / 反查 */
+function renderSharedTable(d) {
+  const body = document.getElementById("shared-body");
+  if (!d.shared_blocks.length) {
+    body.innerHTML = `<tr><td colspan="7" class="empty small">当前没有被多个文件共享的数据块</td></tr>`;
+    return;
+  }
+  body.innerHTML = d.shared_blocks.map((b, i) => `
+    <tr style="cursor:pointer" data-bid="${esc(b.block_id)}">
+      <td class="num muted">${i + 1}</td>
+      <td class="mono small">${esc(b.block_id.slice(0, 18))}…</td>
+      <td class="mono small muted">${esc(b.checksum.slice(0, 16))}…</td>
+      <td class="num right">${fmtBytes(b.size)}</td>
+      <td class="num right"><b style="color:var(--ok)">${b.ref_count}</b></td>
+      <td>${b.identical_group
+        ? `<span class="dd-rel exact">仅完全相同组</span>`
+        : `<span class="dd-rel partial">跨组/部分重叠</span>`}</td>
+      <td class="small">${b.paths.map(p =>
+        `<a class="file-link" data-path="${esc(p)}">${esc(p)}</a>`).join("，")}</td>
+    </tr>`).join("");
+  body.querySelectorAll("tr[data-bid]").forEach(tr =>
+    tr.onclick = () => lookupBlock(tr.dataset.bid));
+  body.querySelectorAll("[data-path]").forEach(a =>
+    a.onclick = (e) => { e.stopPropagation(); showFileModal(a.dataset.path); });
+}
+
+async function lookupBlock(q) {
+  const input = document.getElementById("blk-q");
+  input.value = q || input.value;
+  const key = input.value.trim();
+  const hint = document.getElementById("blk-qhint");
+  const res = document.getElementById("blk-result");
+  if (key.length < 6) {
+    hint.textContent = "请输入至少 6 位前缀";
+    return;
+  }
+  hint.textContent = "查询中…";
+  try {
+    const r = await api("GET", "/api/dedup/block_refs?q=" + encodeURIComponent(key));
+    hint.textContent = r.blocks.length ? `命中 ${r.blocks.length} 个块` : "没有匹配的块";
+    if (!r.blocks.length) {
+      res.innerHTML = `<div class="empty small">未找到与「${esc(key)}」匹配的数据块</div>`;
+      return;
+    }
+    res.innerHTML = r.blocks.map(b => `
+      <div style="border:1px solid var(--border);border-radius:9px;padding:12px 14px;margin-bottom:12px">
+        <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:baseline">
+          <b class="mono" style="font-size:13px">${esc(b.block_id)}</b>
+          <span class="small muted">sha256: ${esc(b.checksum.slice(0, 32))}…</span>
+          <span class="small muted">大小 ${fmtBytes(b.size)}</span>
+          <span class="small muted">存活副本 ${b.live_replicas}/${b.desired}</span>
+          <span class="dd-rel ${b.ref_count > 1 ? "exact" : "none"}">被 ${b.ref_count} 个文件引用</span>
+        </div>
+        <div class="table-wrap" style="margin-top:9px"><table class="tbl">
+          <thead><tr><th>#</th><th>引用该块的文件（反查结果）</th>
+            <th class="right">块在文件中的位置</th><th class="right">文件大小</th></tr></thead>
+          <tbody>${b.references.length ? b.references.map(ref => `
+            <tr>
+              <td class="num muted">${ref.index + 1}</td>
+              <td><a class="file-link" data-path="${esc(ref.path)}">${esc(ref.path)}</a></td>
+              <td class="right ref-pos">第 ${ref.index + 1} / ${ref.total_blocks} 块</td>
+              <td class="num right">${fmtBytes(ref.size)}</td>
+            </tr>`).join("")
+            : `<tr><td colspan="4" class="empty small">没有活动文件引用该块（可能仅被历史版本引用）</td></tr>`}
+          </tbody></table></div>
+        <div class="small muted" style="margin-top:7px">
+          副本位置：${b.replicas.map(r =>
+            `<span class="chip">${esc(r.node)} · ${r.live ? r.state : "离线"}</span>`).join(" ")}
+        </div>
+      </div>`).join("");
+    res.querySelectorAll("[data-path]").forEach(a =>
+      a.onclick = () => showFileModal(a.dataset.path));
+  } catch (e) {
+    hint.textContent = "";
+    toast("反查失败：" + e.message, "bad");
+  }
+}
+
+/* ========================================================== Tab 切换 */
+function switchTab(name) {
+  curTab = name;
+  document.querySelectorAll(".tab").forEach(t =>
+    t.classList.toggle("active", t.dataset.tab === name));
+  for (const n of ["list", "graph", "blocks"])
+    document.getElementById("tab-" + n).style.display = n === name ? "" : "none";
+}
+document.querySelectorAll(".tab").forEach(t =>
+  t.onclick = () => switchTab(t.dataset.tab));
+document.getElementById("blk-go").onclick = () => lookupBlock();
+document.getElementById("blk-q").addEventListener("keydown", e => {
+  if (e.key === "Enter") lookupBlock();
+});
+document.getElementById("graph-only-shared").onchange = () =>
+  DATA && renderGraph(DATA);
+
+initPage("dedup.html", "内容去重").then(() => {
+  load().catch(e => toast("加载失败：" + e.message, "bad"));
+});
+</script>
+</body>
+</html>

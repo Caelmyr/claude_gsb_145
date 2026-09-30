@@ -416,6 +416,9 @@ def seed_cluster(nn, datanodes=None, verbose=True):
     nn.write_file_internal("/docs/roadmap.md", ROADMAP_MD.encode(), "admin")
     nn.versions.commit("docs: 会议纪要更新（main 侧）+ 路线图", "admin")
 
+    say("构造内容去重演示场景（完全相同 / 部分重叠）…")
+    _seed_dedup_demo(nn)
+
     say("构造回收站条目 …")
     nn.write_file_internal("/tmp/draft-old.md",
                            "# 旧草稿\n\n这份文档将被删除进回收站。\n".encode(),
@@ -436,6 +439,46 @@ def seed_cluster(nn, datanodes=None, verbose=True):
     nn.meta.flush()
     say("种子数据完成 ✓")
     return True
+
+
+def _seed_dedup_demo(nn):
+    """
+    构造内容去重演示场景（供"内容去重"页展示，必须严格覆盖两类关系）：
+      * 完全相同：blob-3mb.bin 被两份备份逐字节复制；readme/notice 各一份副本；
+      * 部分重叠：只与源文件共享前 1~2 个定长块，尾部不同（块集合不全等）。
+    完全相同的文件在分块/校验和层逐块命中 by_checksum，不产生任何新块；
+    部分重叠的文件只复用前缀块、仅尾部新块需要落盘。
+    """
+    def read_active(path):
+        inode = nn.fs.resolve(path)
+        return nn.read_blocks(inode.get("block_ids", []))
+
+    # ---- 完全相同：整库冷备 + 异地副本（与源文件逐块共享）----
+    blob = read_active("/data/blob-3mb.bin")
+    nn.write_file_internal("/backup/2026-09/blob-3mb.bin", blob, "admin")
+    nn.write_file_internal("/backup/offsite-blob-3mb.bin", blob, "admin")
+    # 小文件同样存在逐字节副本
+    nn.write_file_internal("/backup/2026-09/readme-copy.md",
+                           read_active("/docs/readme.md"), "admin")
+    nn.write_file_internal("/public/notice.bak.txt",
+                           read_active("/public/notice.txt"), "admin")
+
+    # ---- 部分重叠：切出文件前 ~70KiB，保留第 1 个完整定长块 + 新尾巴 ----
+    # 直接取活动文件字节截断，保证前缀块与源文件逐字节相同；
+    # 尾部追加新内容（且总长跨过 64KiB），因此块集合与源文件不全等。
+    sales_head = read_active("/data/sales.csv")[:70_000]
+    nn.write_file_internal(
+        "/backup/2026-09/sales-head-70k.csv",
+        sales_head + b"\n# 2026-09 backup truncation: first 70000 bytes only\n",
+        "admin")
+    log_head = read_active("/logs/cluster-24h.log")[:70_000]
+    nn.write_file_internal(
+        "/backup/2026-09/cluster-log-head.log",
+        log_head + b"\n# archive truncated for dedup demo\n", "system")
+
+    nn.versions.commit(
+        "chore(backup): 9 月冷备（含完全相同副本与部分重叠前缀块，演示内容去重）",
+        "admin")
 
 
 def _seed_users(nn):
