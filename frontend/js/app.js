@@ -208,6 +208,7 @@ const DFSVS = (() => {
     ]},
     { group: "集群", items: [
       { href: "nodes.html", ico: "🖶", name: "节点状态" },
+      { href: "dedup.html", ico: "⛓", name: "内容去重" },
       { href: "stats.html", ico: "📈", name: "存储统计" },
       { href: "logs.html", ico: "🗎", name: "系统日志" },
     ]},

@@ -1683,3 +1683,303 @@ class NameNode:
             paths = [p for p, inode in self.fs.all_files()
                      if bid in inode.get("block_ids", [])]
         return paths
+
+    # ==================================================================
+    # 内容去重分析（去重分析页：节省空间 / 共享关系 / 块反查 / 备份代价）
+    # ==================================================================
+    def _dedup_scan(self):
+        """
+        汇总活动文件树（不含回收站）对块表的引用。
+        返回：
+          files    : [{path,size,blocks,unique,shared_bytes,
+                       shared_refs,saving_bytes,content_hash,block_ids}]
+          blocks   : {bid: {size,checksum,refs:[{path,index}],ref_count,
+                            unique:bool,shared_bytes,saving_bytes}}
+          totals   : 逻辑字节 / 块引用次数 / 去重后唯一块字节 / 节省字节
+        每个文件单独计数，同一文件内理论上不会出现重复块（定长/CDC 分块
+        内容相同才会同 id，正常分块不会），计数均以"文件 × 块"引用为口径。
+        """
+        with self.meta.lock:
+            table = self.meta.get("blocks")["blocks"]
+            rows = []
+            for path, inode in self.fs.all_files():
+                bids = list(inode.get("block_ids", []))
+                rows.append({
+                    "path": path,
+                    "size": inode.get("size", 0),
+                    "content_hash": inode.get("content_hash") or "",
+                    "block_ids": bids,
+                })
+            # 快照，避免锁外读可变结构
+            blk_sizes = {bid: (b.get("size", 0), b.get("checksum", ""))
+                         for bid, b in table.items()}
+
+        blocks = {}
+        logical = refs_total = 0
+        for row in rows:
+            seen = {}
+            for idx, bid in enumerate(row["block_ids"]):
+                if bid in seen:                    # 同文件内防御性去重
+                    seen[bid]["indexes"].append(idx)
+                    continue
+                size, ck = blk_sizes.get(bid, (0, ""))
+                seen[bid] = {"size": size, "indexes": [idx]}
+                rec = blocks.setdefault(bid, {
+                    "id": bid, "size": size, "checksum": ck,
+                    "refs": [], "missing": bid not in blk_sizes})
+                refs_total += 1
+            logical += row["size"]
+            for bid, info in seen.items():
+                blocks[bid]["refs"].append(
+                    {"path": row["path"], "indexes": info["indexes"]})
+
+        unique_bytes = 0
+        saved_bytes = 0
+        shared_blocks = 0
+        for bid, rec in blocks.items():
+            n = len(rec["refs"])
+            rec["ref_count"] = n
+            rec["shared_bytes"] = rec["size"]
+            rec["saving_bytes"] = rec["size"] * (n - 1)
+            unique_bytes += rec["size"]
+            saved_bytes += rec["saving_bytes"]
+            if n > 1:
+                shared_blocks += 1
+
+        files = []
+        for row in rows:
+            per = {}
+            for idx, bid in enumerate(row["block_ids"]):
+                per.setdefault(bid, []).append(idx)
+            uniq = len(per)
+            shared_b = save_b = 0
+            for bid, idxs in per.items():
+                rec = blocks.get(bid)
+                if not rec:
+                    continue
+                if rec["ref_count"] > 1:
+                    shared_b += rec["size"]
+                    save_b += rec["size"]
+            files.append({
+                "path": row["path"],
+                "size": row["size"],
+                "blocks": len(row["block_ids"]),
+                "unique_blocks": uniq,
+                "shared_bytes": shared_b,          # 与他人共享的块容量
+                "shared_refs": sum(
+                    1 for bid in per
+                    if blocks.get(bid, {}).get("ref_count", 1) > 1),
+                "saving_bytes": save_b,            # 该文件在共享块上省下的一份
+                "content_hash": row["content_hash"],
+                "block_ids": row["block_ids"],
+            })
+        files.sort(key=lambda f: (-f["saving_bytes"], f["path"]))
+        totals = {
+            "files": len(rows),
+            "logical_bytes": logical,
+            "block_refs": refs_total,
+            "unique_blocks": len(blocks),
+            "shared_blocks": shared_blocks,
+            "unique_bytes": unique_bytes,
+            "saved_bytes": saved_bytes,
+            "missing_blocks": sum(1 for b in blocks.values() if b["missing"]),
+        }
+        return files, blocks, totals
+
+    def _dedup_storage(self):
+        """块表口径的物理占用（唯一块字节 × 各自副本数）。"""
+        with self.meta.lock:
+            table = list(self.meta.get("blocks")["blocks"].values())
+        unique = sum(b.get("size", 0) for b in table)
+        physical = sum(b.get("size", 0) * len(self.live_good_replicas(b))
+                       for b in table)
+        return {"table_blocks": len(table), "table_unique_bytes": unique,
+                "table_physical_bytes": physical}
+
+    def dedup_overview(self):
+        files, blocks, totals = self._dedup_scan()
+        storage = self._dedup_storage()
+
+        # ---- 文件间关系：完全相同（内容哈希一致）/ 部分重叠（仅共享部分块）
+        identical = {}
+        for f in files:
+            if f["blocks"] <= 0 or not f["content_hash"]:
+                continue
+            identical.setdefault(f["content_hash"], []).append(f["path"])
+        identical_groups = [sorted(ps) for ps in identical.values()
+                            if len(ps) > 1]
+        identical_flat = {p for g in identical_groups for p in g}
+
+        # 共享块反查文件对 -> 逐对统计共享块（排除完全相同的对）
+        pair = {}
+        for bid, rec in blocks.items():
+            if rec["ref_count"] < 2:
+                continue
+            ps = sorted(r["path"] for r in rec["refs"])
+            for i in range(len(ps)):
+                for j in range(i + 1, len(ps)):
+                    ent = pair.setdefault((ps[i], ps[j]),
+                                          {"blocks": 0, "bytes": 0,
+                                           "block_ids": []})
+                    ent["blocks"] += 1
+                    ent["bytes"] += rec["size"]
+                    ent["block_ids"].append(bid)
+        partial_edges, identical_edges = [], []
+        fmap = {f["path"]: f for f in files}
+        for (a, b), ent in pair.items():
+            edge = {
+                "a": a, "b": b,
+                "shared_blocks": ent["blocks"],
+                "shared_bytes": ent["bytes"],
+                "a_blocks": fmap[a]["blocks"],
+                "b_blocks": fmap[b]["blocks"],
+                "a_size": fmap[a]["size"],
+                "b_size": fmap[b]["size"],
+                "block_ids": ent["block_ids"],
+            }
+            if a in identical_flat and b in identical_flat and \
+                    fmap[a]["content_hash"] == fmap[b]["content_hash"]:
+                identical_edges.append(edge)
+            else:
+                # 共享了块但块序列不同 => 严格的部分重叠，不能报为完全相同
+                partial_edges.append(edge)
+        identical_edges.sort(key=lambda e: -e["shared_bytes"])
+        partial_edges.sort(key=lambda e: (-e["shared_bytes"],
+                                          e["a"], e["b"]))
+
+        # ---- 版本历史 / 回收站额外引用（仅版本或回收站引用的块也算在物理占用内）
+        version_block_ids = self.versions.all_referenced_blocks()
+        with self.meta.lock:
+            trash_ids = set()
+            trash_root = self.fs.get_inode(self.fs.trash_id)
+            inodes = self.fs._inodes()
+            if trash_root:
+                stack = list(trash_root.get("children", []))
+                while stack:
+                    cur = stack.pop()
+                    node = inodes.get(cur)
+                    if not node:
+                        continue
+                    trash_ids.update(node.get("block_ids", []))
+                    stack.extend(node.get("children", []))
+        active_ids = set(blocks)
+        version_only_ids = version_block_ids - active_ids - trash_ids
+        trash_only_ids = trash_ids - active_ids - version_block_ids
+
+        with self.meta.lock:
+            table = self.meta.get("blocks")["blocks"]
+            version_only_bytes = sum(
+                table[b]["size"] for b in version_only_ids if b in table)
+            trash_only_bytes = sum(
+                table[b]["size"] for b in trash_only_ids if b in table)
+
+        default_rf = config.DEFAULT_REPLICATION
+        extra_copy_bytes = totals["unique_bytes"]
+        return {
+            "totals": totals,
+            "storage": {**storage,
+                        "version_only_blocks": len(version_only_ids),
+                        "version_only_bytes": version_only_bytes,
+                        "trash_only_blocks": len(trash_only_ids),
+                        "trash_only_bytes": trash_only_bytes,
+                        "replication": default_rf},
+            "files": files,
+            "shared_blocks": sorted(
+                (b for b in blocks.values() if b["ref_count"] > 1),
+                key=lambda b: (-b["ref_count"], -b["saving_bytes"])),
+            "identical_groups": identical_groups,
+            "identical_edges": identical_edges,
+            "partial_edges": partial_edges,
+            "backup_cost": {
+                # 再补一份"去重感知"的逻辑备份：块只存一份
+                "dedup_aware_bytes": extra_copy_bytes,
+                # 朴素全量备份（不做去重）：每个文件各存一份
+                "naive_bytes": totals["logical_bytes"],
+                "saved_vs_naive_bytes":
+                    totals["logical_bytes"] - extra_copy_bytes,
+                "replication": default_rf,
+                "note": "再补一份去重感知备份只需搬运唯一块字节；"
+                        "朴素全量备份按逻辑字节计费",
+            },
+        }
+
+    def dedup_block_detail(self, bid):
+        """块反查：哪些活动文件、哪些历史提交快照、回收站项引用了它。"""
+        with self.meta.lock:
+            blk = self.meta.get("blocks")["blocks"].get(bid)
+            blk_info = dict(blk) if blk else None
+            active = []
+            for path, inode in self.fs.all_files():
+                idxs = [i for i, x in enumerate(inode.get("block_ids", []))
+                        if x == bid]
+                if idxs:
+                    active.append({"path": path, "indexes": idxs,
+                                   "size": inode.get("size", 0)})
+            trash_items = []
+            trash_root = self.fs.get_inode(self.fs.trash_id)
+            inodes = self.fs._inodes()
+            rec_items = self.meta.get("recycle").get("items", {})
+            if trash_root:
+                for rc in rec_items.values():
+                    node = inodes.get(rc.get("inode"))
+                    if not node:
+                        continue
+                    hit = []
+                    stack = [node.get("id")]
+                    while stack:
+                        cur = stack.pop()
+                        n = inodes.get(cur)
+                        if not n:
+                            continue
+                        for i, x in enumerate(n.get("block_ids", [])):
+                            if x == bid:
+                                hit.append({"path": n.get("_orig_name")
+                                            or n.get("name"), "index": i})
+                        stack.extend(n.get("children", []))
+                    if hit:
+                        trash_items.append({
+                            "id": rc.get("id"),
+                            "name": rc.get("name"),
+                            "original_path": rc.get("original_path"),
+                            "hits": hit})
+            v = self.meta.get("versions")
+            commits = v.get("commits", {})
+        version_refs = []
+        for cid, c in commits.items():
+            paths = []
+            for p, e in c.get("snapshot", {}).items():
+                if bid in e.get("block_ids", []):
+                    paths.append(p)
+            if paths:
+                version_refs.append({
+                    "commit": cid,
+                    "short": short_hash(cid.replace("c_", ""), 8),
+                    "message": c.get("message", ""),
+                    "author": c.get("author", ""),
+                    "ts": c.get("ts"),
+                    "paths": sorted(paths)})
+        version_refs.sort(key=lambda x: x.get("ts", 0), reverse=True)
+        if not blk_info:
+            raise NNError(f"块不存在: {bid}")
+        live = self.live_good_replicas(blk_info)
+        return {
+            "block": {
+                "id": bid,
+                "short": short_hash(bid.replace("blk_", ""), 10),
+                "size": blk_info.get("size", 0),
+                "checksum": blk_info.get("checksum", ""),
+                "genstamp": blk_info.get("genstamp"),
+                "desired": blk_info.get("desired"),
+                "live_replicas": len(live),
+                "created_at": blk_info.get("created_at"),
+                "replicas": [
+                    {"node": nid, "state": r.get("state"),
+                     "genstamp": r.get("genstamp")}
+                    for nid, r in sorted(
+                        (blk_info.get("replicas") or {}).items())],
+            },
+            "active_refs": sorted(active, key=lambda x: x["path"]),
+            "trash_refs": trash_items,
+            "version_refs": version_refs[:50],
+            "version_refs_total": len(version_refs),
+        }

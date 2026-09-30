@@ -655,6 +655,23 @@ def api_stats_timeline(ctx):
 
 
 # ============================================================================
+# API: 内容去重分析（共享块 / 节省空间 / 块反查 / 备份代价）
+# ============================================================================
+
+@route("GET", "/api/dedup/overview")
+def api_dedup_overview(ctx):
+    return ctx.nn.dedup_overview()
+
+
+@route("GET", "/api/dedup/block")
+def api_dedup_block(ctx):
+    bid = ctx.query.get("id", "")
+    if not bid:
+        raise ApiError(400, "缺少块 id 参数")
+    return ctx.nn.dedup_block_detail(bid)
+
+
+# ============================================================================
 # API: 用户管理
 # ============================================================================
 

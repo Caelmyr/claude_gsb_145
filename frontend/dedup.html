@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>内容去重 · DFSVS</title>
+<link rel="stylesheet" href="css/app.css">
+<style>
+  /* ---- 去重分析页局部样式 ---- */
+  .dd-rel { width: 100%; height: 480px; background:
+    radial-gradient(circle at 50% 42%, rgba(79,140,255,.05), transparent 70%);
+    border: 1px solid var(--border-soft); border-radius: 10px; }
+  .dd-node { cursor: pointer; }
+  .dd-node circle { stroke-width: 2; transition: r .15s; }
+  .dd-node text { font-size: 10.5px; fill: var(--text); pointer-events: none;
+    font-family: var(--mono); }
+  .dd-node.same circle { fill: rgba(47,191,113,.18); stroke: var(--ok); }
+  .dd-node.partial circle { fill: rgba(240,165,56,.16); stroke: var(--warn); }
+  .dd-node.hl circle { stroke-width: 3.5; }
+  .dd-edge { stroke-linecap: round; }
+  .dd-edge.same { stroke: var(--ok); }
+  .dd-edge.partial { stroke: var(--warn); stroke-dasharray: 6 4; }
+  .dd-edge.dim, .dd-node.dim { opacity: .12; }
+  .dd-edge.hl { stroke-width: 4.5; }
+  .dd-tip {
+    position: fixed; z-index: 60; pointer-events: none; display: none;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 10px; font-size: 12px; max-width: 340px;
+    box-shadow: 0 8px 26px rgba(0,0,0,.45); }
+  .blk-cell { font-family: var(--mono); font-size: 11.5px; }
+  .blk-cell .ck { color: var(--muted); }
+  .rel-badge { display: inline-flex; align-items: center; gap: 5px;
+    padding: 2px 9px; border-radius: 20px; font-size: 11.5px; font-weight: 600; }
+  .rel-badge.same { color: var(--ok); background: var(--ok-soft);
+    border: 1px solid rgba(47,191,113,.35); }
+  .rel-badge.partial { color: var(--warn); background: var(--warn-soft);
+    border: 1px solid rgba(240,165,56,.35); }
+  .grp-card { border: 1px solid var(--border-soft); border-radius: 9px;
+    padding: 10px 12px; margin-bottom: 9px; background: rgba(47,191,113,.04); }
+  .segbar { display: inline-flex; border: 1px solid var(--border);
+    border-radius: 7px; overflow: hidden; }
+  .segbar button { background: transparent; border: 0; color: var(--muted);
+    padding: 5px 13px; font-size: 12.5px; cursor: pointer; }
+  .segbar button.active { background: var(--accent); color: #fff; }
+  .mini-kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 14px;
+    font-size: 12.5px; }
+  .mini-kv .k { color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="layout">
+  <aside id="sidebar" class="sidebar"></aside>
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <h1 id="page-title">内容去重</h1>
+        <div class="sub" id="page-sub">相同内容共享数据块 · 去重节省 · 块引用反查 · 再补一份备份的代价</div>
+      </div>
+      <div class="spacer"></div>
+      <div class="userchip" id="userchip"></div>
+    </header>
+
+    <section class="content">
+      <!-- KPI -->
+      <div class="grid cols-5" id="kpi-row" style="margin-bottom:16px"></div>
+
+      <div class="grid cols-2">
+        <!-- 节省构成 -->
+        <div class="card">
+          <div class="card-title">去重收益构成 <span class="hint">活动文件口径（不含回收站）· 每个内容块在集群内只存一份</span></div>
+          <div style="display:flex;gap:24px;align-items:center;flex-wrap:wrap">
+            <div id="save-donut"></div>
+            <div style="flex:1;min-width:230px" id="save-detail"></div>
+          </div>
+        </div>
+
+        <!-- 再补一份备份的代价 -->
+        <div class="card">
+          <div class="card-title">再补一份备份的代价 <span class="hint">块不可变，复制备份时已存在的块可直接引用</span></div>
+          <div id="backup-box"></div>
+        </div>
+      </div>
+
+      <!-- 完全相同文件组 -->
+      <div class="card" style="margin-top:14px">
+        <div class="card-title">完全相同的文件组 <span class="hint">整文件内容哈希一致（块序列逐一相同），互相共享全部数据块</span></div>
+        <div id="identical-box"></div>
+      </div>
+
+      <!-- 共享关系：列表 + 关系视图 -->
+      <div class="card" style="margin-top:14px">
+        <div class="card-title" style="display:flex;align-items:center;gap:10px">
+          <span>共享关系</span>
+          <span class="hint">实线/绿色 = 完全相同，虚线/橙色 = 仅部分块重叠（不会误报为相同）</span>
+          <span class="spacer"></span>
+          <div class="segbar" id="rel-seg">
+            <button data-v="graph" class="active">关系视图</button>
+            <button data-v="list">列表</button>
+          </div>
+        </div>
+        <div id="rel-graph-wrap"><svg class="dd-rel" id="rel-graph"></svg>
+          <div class="small muted" style="margin-top:6px">
+            点击文件节点查看其共享情况；点击连线查看该对文件具体共享了哪些块。
+          </div>
+        </div>
+        <div id="rel-list-wrap" style="display:none"></div>
+      </div>
+
+      <!-- 共享块列表（可反查） -->
+      <div class="card" style="margin-top:14px">
+        <div class="card-title" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <span>被共享的数据块</span>
+          <span class="hint">点击行反查所有引用它的文件 / 历史版本 / 回收站</span>
+          <span class="spacer"></span>
+          <input type="text" id="blk-q" placeholder="按块 id 或校验和前缀搜索…"
+            class="fl" style="max-width:260px;padding:5px 10px;background:var(--bg);
+            border:1px solid var(--border);border-radius:7px;color:var(--text);font-size:12.5px">
+        </div>
+        <div class="table-wrap"><table class="tbl">
+          <thead><tr>
+            <th>数据块</th><th class="right">大小</th><th class="right">引用文件数</th>
+            <th class="right">每份副本</th><th class="right">该块节省（逻辑）</th>
+            <th>引用文件</th><th></th>
+          </tr></thead>
+          <tbody id="blk-body"></tbody>
+        </table></div>
+        <div class="small muted" id="blk-summary" style="margin-top:8px"></div>
+      </div>
+
+      <!-- 文件去重清单 -->
+      <div class="card" style="margin-top:14px">
+        <div class="card-title" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <span>文件去重清单</span>
+          <span class="hint">每个活动文件有多少块与他人共享、若不去重需多占多少</span>
+          <span class="spacer"></span>
+          <div class="segbar" id="f-seg">
+            <button data-v="shared" class="active">仅含共享块</button>
+            <button data-v="all">全部文件</button>
+          </div>
+        </div>
+        <div class="table-wrap"><table class="tbl">
+          <thead><tr>
+            <th>文件</th><th class="right">逻辑大小</th><th class="right">块数</th>
+            <th class="right">共享块</th><th class="right">共享容量</th>
+            <th class="right">该文件受益</th><th>关系</th>
+          </tr></thead>
+          <tbody id="file-body"></tbody>
+        </table></div>
+      </div>
+    </section>
+  </main>
+</div>
+<div class="dd-tip" id="dd-tip"></div>
+<div id="toasts"></div>
+<script src="js/app.js"></script>
+<script>
+"use strict";
+const { api, esc, fmtBytes, fmtTs, toast, svgDonut, legend, PALETTE, modal } = DFSVS;
+
+let DATA = null;
+let relMode = "graph";
+let fileFilter = "shared";
+
+// ------------------------------------------------------------------ 加载
+async function loadAll() {
+  DATA = await api("GET", "/api/dedup/overview");
+  renderKpis(DATA);
+  renderSave(DATA);
+  renderBackup(DATA);
+  renderIdentical(DATA);
+  renderRelGraph(DATA);
+  renderRelList(DATA);
+  renderBlocks(DATA);
+  renderFiles(DATA);
+}
+
+// ------------------------------------------------------------------ KPI
+function pct(a, b) { return b ? (a / b * 100) : 0; }
+
+function renderKpis(d) {
+  const t = d.totals;
+  const cells = [
+    { label: "逻辑数据量", value: fmtBytes(t.logical_bytes),
+      sub: `${t.files} 个活动文件 / ${t.block_refs} 次块引用`, cls: "accent" },
+    { label: "去重后唯一块", value: fmtBytes(t.unique_bytes),
+      sub: `${t.unique_blocks} 个唯一块（每份只存一次）`, cls: "" },
+    { label: "去重节省", value: fmtBytes(t.saved_bytes),
+      sub: `占逻辑数据 ${pct(t.saved_bytes, t.logical_bytes).toFixed(1)}%`, cls: "ok" },
+    { label: "共享块", value: t.shared_blocks,
+      sub: `被 ≥2 个文件引用的块`, cls: "" },
+    { label: "物理占用（全块表）", value: fmtBytes(d.storage.table_physical_bytes),
+      sub: `含版本历史 / 回收站 · 含 ${d.storage.replication} 副本`, cls: "" },
+  ];
+  document.getElementById("kpi-row").innerHTML = cells.map(c => `
+    <div class="kpi ${c.cls}">
+      <div class="k-label">${esc(c.label)}</div>
+      <div class="k-value">${esc(c.value)}</div>
+      <div class="k-sub">${esc(c.sub)}</div>
+    </div>`).join("");
+}
+
+// ------------------------------------------------------------------ 节省构成
+function renderSave(d) {
+  const t = d.totals;
+  document.getElementById("save-donut").innerHTML = svgDonut([
+    { label: "唯一数据（必须存储）", value: t.unique_bytes,
+      valueText: fmtBytes(t.unique_bytes), color: "#4f8cff" },
+    { label: "去重节省（重复引用）", value: t.saved_bytes,
+      valueText: fmtBytes(t.saved_bytes), color: "#2fbf71" },
+  ], 175, 28, pct(t.saved_bytes, t.logical_bytes).toFixed(1) + "%", "节省占比");
+  const s = d.storage;
+  document.getElementById("save-detail").innerHTML = `
+    <div class="kv">
+      <span class="k">逻辑引用合计</span><span class="v">${fmtBytes(t.logical_bytes)}（${t.block_refs} 次块引用）</span>
+      <span class="k">唯一块合计</span><span class="v">${fmtBytes(t.unique_bytes)}（${t.unique_blocks} 块）</span>
+      <span class="k">去重节省（逻辑）</span><span class="v" style="color:var(--ok)"><b>${fmtBytes(t.saved_bytes)}</b></span>
+      <span class="k">仅历史版本持有</span><span class="v">${fmtBytes(s.version_only_bytes)}（${s.version_only_blocks} 块）</span>
+      <span class="k">仅回收站持有</span><span class="v">${fmtBytes(s.trash_only_bytes)}（${s.trash_only_blocks} 块）</span>
+      <span class="k">块表物理占用</span><span class="v">${fmtBytes(s.table_physical_bytes)}（×${s.replication} 副本）</span>
+    </div>` +
+    legend([
+      { label: "唯一数据", valueText: fmtBytes(t.unique_bytes), color: "#4f8cff" },
+      { label: "去重节省", valueText: fmtBytes(t.saved_bytes), color: "#2fbf71" },
+    ]);
+}
+
+// ------------------------------------------------------------------ 备份代价
+function renderBackup(d) {
+  const b = d.backup_cost;
+  const savingPct = pct(b.saved_vs_naive_bytes, b.naive_bytes);
+  document.getElementById("backup-box").innerHTML = `
+    <div style="display:flex;gap:18px;align-items:stretch;flex-wrap:wrap">
+      <div style="flex:1;min-width:190px;border:1px solid var(--border-soft);border-radius:9px;padding:12px">
+        <div class="small muted">朴素全量备份（不去重）</div>
+        <div style="font-size:22px;font-weight:700;font-family:var(--mono);margin:4px 0">${fmtBytes(b.naive_bytes)}</div>
+        <div class="small muted">每个文件各拷贝一份</div>
+      </div>
+      <div style="display:flex;align-items:center;color:var(--muted)">→</div>
+      <div style="flex:1;min-width:190px;border:1px solid rgba(47,191,113,.35);background:rgba(47,191,113,.05);border-radius:9px;padding:12px">
+        <div class="small" style="color:var(--ok)">去重感知备份（块只存一份）</div>
+        <div style="font-size:22px;font-weight:700;font-family:var(--mono);margin:4px 0;color:var(--ok)">${fmtBytes(b.dedup_aware_bytes)}</div>
+        <div class="small muted">已存在的块只追加引用</div>
+      </div>
+    </div>
+    <hr class="hr">
+    <div class="mini-kv">
+      <span class="k">相对朴素备份少搬运</span><b style="color:var(--ok)">${fmtBytes(b.saved_vs_naive_bytes)}（${savingPct.toFixed(1)}%）</b>
+      <span class="k">说明</span><span class="muted">${esc(b.note)}；集群内副本因子 ×${b.replication} 为冗余开销，与内容去重相互独立。</span>
+    </div>`;
+}
+
+// ------------------------------------------------------------------ 完全相同组
+function renderIdentical(d) {
+  const box = document.getElementById("identical-box");
+  if (!d.identical_groups.length) {
+    box.innerHTML = `<div class="empty small">当前没有内容完全相同的文件</div>`;
+    return;
+  }
+  const fmap = Object.fromEntries(d.files.map(f => [f.path, f]));
+  box.innerHTML = d.identical_groups.map(g => {
+    const f0 = fmap[g[0]] || { size: 0, blocks: 0 };
+    const saveOnce = f0.size;                       // 每组 N 份只存 1 份
+    const saved = saveOnce * (g.length - 1);
+    return `<div class="grp-card">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <span class="rel-badge same">✓ 完全相同</span>
+        <span class="small muted mono">${esc((f0.content_hash || "").slice(0, 16))}…</span>
+        <span class="spacer" style="flex:1"></span>
+        <span class="small muted">${f0.blocks} 块全部共享 · 单份 ${fmtBytes(f0.size)} · ${g.length} 份共省 <b style="color:var(--ok)">${fmtBytes(saved)}</b></span>
+      </div>
+      <div style="margin-top:7px;display:flex;gap:8px;flex-wrap:wrap">
+        ${g.map(p => `<a class="chip" href="files.html?path=${esc(encodeURIComponent("/" + p.split("/").slice(1, -1).join("/")))}">${esc(p)}</a>`).join("")}
+      </div>
+    </div>`;
+  }).join("");
+}
+
+// ------------------------------------------------------------------ 关系视图（力导向）
+const SIM = { W: 960, H: 480 };
+
+function relKindMap(d) {
+  const map = new Map();
+  d.identical_edges.forEach(e => map.set(e.a + "\u0001" + e.b, "same"));
+  d.partial_edges.forEach(e => map.set(e.a + "\u0001" + e.b, "partial"));
+  return map;
+}
+
+function buildGraph(d) {
+  const kind = relKindMap(d);
+  const nodeSet = new Map();
+  const edges = [];
+  const add = (p) => {
+    if (!nodeSet.has(p)) nodeSet.set(p, { id: p });
+  };
+  [...d.identical_edges, ...d.partial_edges].forEach(e => {
+    add(e.a); add(e.b);
+    edges.push({ source: e.a, target: e.b,
+      kind: kind.get(e.a + "\u0001" + e.b) || "partial",
+      raw: e });
+  });
+  return { nodes: [...nodeSet.values()], edges };
+}
+
+let simState = null;
+
+function renderRelGraph(d) {
+  const svg = document.getElementById("rel-graph");
+  const graph = buildGraph(d);
+  if (!graph.nodes.length) {
+    svg.innerHTML = `<text x="480" y="240" text-anchor="middle" fill="#8b93a7">暂无共享块的文件</text>`;
+    simState = null;
+    return;
+  }
+  const W = SIM.W, H = SIM.H;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  // 初始化位置：环形
+  const n = graph.nodes.length;
+  graph.nodes.forEach((nd, i) => {
+    if (!nd.x) {
+      const ang = (i / n) * Math.PI * 2;
+      nd.x = W / 2 + Math.cos(ang) * Math.min(W, H) * 0.32;
+      nd.y = H / 2 + Math.sin(ang) * Math.min(W, H) * 0.32;
+    }
+    nd.vx = nd.vy = 0;
+  });
+  const deg = {};
+  graph.edges.forEach(e => {
+    deg[e.source] = (deg[e.source] || 0) + 1;
+    deg[e.target] = (deg[e.target] || 0) + 1;
+  });
+  const sameNodes = new Set();
+  d.identical_groups.forEach(g => g.forEach(p => sameNodes.add(p)));
+
+  function tick() {
+    const kc = 0.012, kr = 2600;
+    for (let i = 0; i < graph.nodes.length; i++) {
+      const a = graph.nodes[i];
+      a.vx += (W / 2 - a.x) * kc * 0.35;
+      a.vy += (H / 2 - a.y) * kc * 0.35;
+      for (let j = i + 1; j < graph.nodes.length; j++) {
+        const b = graph.nodes[j];
+        let dx = a.x - b.x, dy = a.y - b.y;
+        let dist = Math.sqrt(dx * dx + dy * dy) || 1;
+        const f = kr / (dist * dist);
+        dx = dx / dist * f; dy = dy / dist * f;
+        a.vx += dx; a.vy += dy; b.vx -= dx; b.vy -= dy;
+      }
+    }
+    graph.edges.forEach(e => {
+      const a = graph.nodes.find(z => z.id === e.source);
+      const b = graph.nodes.find(z => z.id === e.target);
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+      const want = e.kind === "same" ? 120 : 175;
+      const f = (dist - want) * 0.012;
+      const fx = dx / dist * f, fy = dy / dist * f;
+      a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
+    });
+    graph.nodes.forEach(nd => {
+      nd.vx = (nd.vx || 0) * 0.82; nd.vy = (nd.vy || 0) * 0.82;
+      nd.x = Math.max(70, Math.min(W - 70, nd.x + nd.vx));
+      nd.y = Math.max(40, Math.min(H - 46, nd.y + nd.vy));
+    });
+  }
+
+  // 预跑 220 轮让布局收敛
+  for (let i = 0; i < 220; i++) tick();
+
+  const tip = document.getElementById("dd-tip");
+  const edgeEls = graph.edges.map((e, i) => {
+    const a = graph.nodes.find(z => z.id === e.source);
+    const b = graph.nodes.find(z => z.id === e.target);
+    const ln = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    ln.setAttribute("class", `dd-edge ${e.kind}`);
+    ln.setAttribute("x1", a.x); ln.setAttribute("y1", a.y);
+    ln.setAttribute("x2", b.x); ln.setAttribute("y2", b.y);
+    ln.setAttribute("stroke-width", e.kind === "same" ? 3.4 : 2.2);
+    ln.dataset.i = i;
+    ln.addEventListener("mousemove", ev => {
+      const r = e.raw;
+      tip.style.display = "block";
+      tip.style.left = (ev.clientX + 14) + "px";
+      tip.style.top = (ev.clientY + 12) + "px";
+      tip.innerHTML = `<b>${esc(r.a.split("/").pop())}</b> ↔ <b>${esc(r.b.split("/").pop())}</b><br>
+        共享 ${r.shared_blocks} 块 / ${fmtBytes(r.shared_bytes)}<br>
+        <span class="muted">${e.kind === "same" ? "完全相同（全部块一致）" : "部分重叠"}</span>`;
+    });
+    ln.addEventListener("mouseleave", () => tip.style.display = "none");
+    ln.addEventListener("click", () => showEdgeDetail(d, e.raw, e.kind));
+    return ln;
+  });
+
+  const nodeEls = graph.nodes.map(nd => {
+    const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    g.setAttribute("class", `dd-node ${sameNodes.has(nd.id) ? "same" : "partial"}`);
+    g.setAttribute("transform", `translate(${nd.x},${nd.y})`);
+    const r = 9 + Math.min(12, (deg[nd.id] || 1) * 2.2);
+    const c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+    c.setAttribute("r", r);
+    const t = document.createElementNS("http://www.w3.org/2000/svg", "text");
+    const name = nd.id.split("/").pop();
+    t.setAttribute("y", r + 13);
+    t.setAttribute("text-anchor", "middle");
+    t.textContent = name.length > 22 ? name.slice(0, 20) + "…" : name;
+    g.appendChild(c); g.appendChild(t);
+    g.addEventListener("mousemove", ev => {
+      tip.style.display = "block";
+      tip.style.left = (ev.clientX + 14) + "px";
+      tip.style.top = (ev.clientY + 12) + "px";
+      tip.innerHTML = `<b>${esc(nd.id)}</b><br>共享关系 ${deg[nd.id] || 0} 条`;
+    });
+    g.addEventListener("mouseleave", () => tip.style.display = "none");
+    g.addEventListener("click", () => showFileDetail(d, nd.id));
+    return g;
+  });
+
+  svg.innerHTML = "";
+  edgeEls.forEach(el => svg.appendChild(el));
+  nodeEls.forEach(el => svg.appendChild(el));
+  simState = { graph, edgeEls, nodeEls, sameNodes };
+}
+
+// ------------------------------------------------------------------ 关系列表
+function renderRelList(d) {
+  const wrap = document.getElementById("rel-list-wrap");
+  const row = (e, kind) => `<tr style="cursor:pointer" data-kind="${kind}">
+      <td><span class="rel-badge ${kind}">${kind === "same" ? "✓ 完全相同" : "▴ 部分重叠"}</span></td>
+      <td class="mono small">${esc(e.a)}</td>
+      <td class="mono small">${esc(e.b)}</td>
+      <td class="num right">${e.shared_blocks} / ${Math.max(e.a_blocks, e.b_blocks)}</td>
+      <td class="num right">${fmtBytes(e.shared_bytes)}</td>
+      <td>${kind === "same"
+        ? `<span class="small muted">块序列逐一相同</span>`
+        : `<div class="pbar thin" style="min-width:110px"><i style="width:${pct(e.shared_blocks, Math.max(e.a_blocks, e.b_blocks)).toFixed(1)}%;background:var(--warn)"></i></div>`}</td>
+    </tr>`;
+  const sameRows = d.identical_edges.map(e => row(e, "same")).join("");
+  const partRows = d.partial_edges.map(e => row(e, "partial")).join("");
+  wrap.innerHTML = `<div class="table-wrap"><table class="tbl">
+      <thead><tr><th style="width:110px">关系</th><th>文件 A</th><th>文件 B</th>
+        <th class="right">共享块/最多块</th><th class="right">共享容量</th><th>重叠程度</th></tr></thead>
+      <tbody id="rel-tbody">${sameRows}${partRows}</tbody>
+    </table></div>
+    <div class="small muted" style="margin-top:6px">
+      「完全相同」依据整文件内容哈希判定；仅共享部分块的文件对一律列为「部分重叠」。点击行查看共享的具体块。
+    </div>`;
+  wrap.querySelectorAll("tbody tr").forEach((tr, i) => {
+    const same = tr.dataset.kind === "same";
+    const list = same ? d.identical_edges : d.partial_edges;
+    const idx = same ? i : i - d.identical_edges.length;
+    tr.onclick = () => showEdgeDetail(d, list[idx], tr.dataset.kind);
+  });
+}
+
+// ------------------------------------------------------------------ 共享块表
+function blockShort(b) {
+  return (b.id || "").replace("blk_", "").slice(0, 12);
+}
+
+function renderBlocks(d, q = "") {
+  const body = document.getElementById("blk-body");
+  const ql = q.trim().toLowerCase();
+  const list = d.shared_blocks.filter(b => !ql
+    || b.id.toLowerCase().includes(ql)
+    || (b.checksum || "").toLowerCase().startsWith(ql)
+    || (b.checksum || "").toLowerCase().includes(ql));
+  if (!list.length) {
+    body.innerHTML = `<tr><td colspan="7" class="empty small">没有符合条件的共享块</td></tr>`;
+  } else {
+    body.innerHTML = list.map(b => `
+      <tr style="cursor:pointer" data-bid="${esc(b.id)}">
+        <td class="blk-cell">blk_${esc(blockShort(b))}…<br>
+          <span class="ck">sha256:${esc((b.checksum || "").slice(0, 20))}…</span></td>
+        <td class="num right">${fmtBytes(b.size)}</td>
+        <td class="num right"><b style="color:var(--accent)">${b.ref_count}</b></td>
+        <td class="num right">×${d.storage.replication}</td>
+        <td class="num right" style="color:var(--ok)">${fmtBytes(b.saving_bytes)}</td>
+        <td class="small">${b.refs.slice(0, 3).map(r =>
+          `<span class="chip">${esc(r.path.split("/").pop())}</span>`).join(" ")}
+          ${b.ref_count > 3 ? `<span class="muted">+${b.ref_count - 3}</span>` : ""}</td>
+        <td class="small muted nowrap">反查 ›</td>
+      </tr>`).join("");
+    body.querySelectorAll("tr").forEach(tr => {
+      tr.onclick = () => openBlockDetail(tr.dataset.bid);
+    });
+  }
+  document.getElementById("blk-summary").textContent =
+    `${d.shared_blocks.length} 个共享块 · 合计节省逻辑容量 ${fmtBytes(d.totals.saved_bytes)}` +
+    (ql ? ` · 过滤后 ${list.length} 个` : "");
+}
+
+// ------------------------------------------------------------------ 文件清单
+function renderFiles(d) {
+  const body = document.getElementById("file-body");
+  const sameGroups = d.identical_groups;
+  const grpOf = {};
+  sameGroups.forEach((g, i) => g.forEach(p => grpOf[p] = i));
+  let list = d.files;
+  if (fileFilter === "shared") list = list.filter(f => f.shared_refs > 0);
+  if (!list.length) {
+    body.innerHTML = `<tr><td colspan="7" class="empty small">没有与他人共享块的文件</td></tr>`;
+    return;
+  }
+  body.innerHTML = list.map(f => {
+    const gi = grpOf[f.path];
+    const rel = gi !== undefined
+      ? `<span class="rel-badge same">✓ 与 ${sameGroups[gi].length - 1} 份完全相同</span>`
+      : f.shared_refs
+        ? `<span class="rel-badge partial">▴ 部分块重叠</span>`
+        : `<span class="badge dim">独占</span>`;
+    return `<tr ${f.shared_refs ? `style="cursor:pointer" data-p="${esc(f.path)}"` : ""}>
+      <td class="mono small">${esc(f.path)}</td>
+      <td class="num right">${fmtBytes(f.size)}</td>
+      <td class="num right">${f.blocks}</td>
+      <td class="num right">${f.shared_refs} / ${f.unique_blocks}</td>
+      <td class="num right">${fmtBytes(f.shared_bytes)}</td>
+      <td class="num right" style="color:${f.saving_bytes ? "var(--ok)" : "inherit"}">${fmtBytes(f.saving_bytes)}</td>
+      <td>${rel}</td>
+    </tr>`;
+  }).join("");
+  body.querySelectorAll("tr[data-p]").forEach(tr => {
+    tr.onclick = () => showFileDetail(DATA, tr.dataset.p);
+  });
+}
+
+// ------------------------------------------------------------------ 弹窗：文件
+async function showFileDetail(d, path) {
+  // 找出与该文件相关的全部关系
+  const rels = [
+    ...d.identical_edges.map(e => ({ e, kind: "same" })),
+    ...d.partial_edges.map(e => ({ e, kind: "partial" })),
+  ].filter(({ e }) => e.a === path || e.b === path)
+    .map(({ e, kind }) => ({ ...e, kind, other: e.a === path ? e.b : e.a }));
+  const f = d.files.find(x => x.path === path);
+  modal({
+    title: "文件共享情况",
+    wide: true,
+    body: `<div style="font-size:13.5px">
+      <div class="mono" style="margin-bottom:8px;word-break:break-all">${esc(path)}</div>
+      <div class="mini-kv" style="margin-bottom:10px">
+        <span class="k">逻辑大小</span><span>${fmtBytes(f.size)} · ${f.blocks} 块</span>
+        <span class="k">共享块</span><span>${f.shared_refs} 块 / ${fmtBytes(f.shared_bytes)}</span>
+        <span class="k">去重受益</span><span style="color:var(--ok)">${fmtBytes(f.saving_bytes)}</span>
+      </div>
+      <div class="card-title" style="font-size:13px">与其他文件的关系（${rels.length}）</div>
+      <div class="table-wrap"><table class="tbl">
+        <thead><tr><th>关系</th><th>对方文件</th><th class="right">共享块</th><th class="right">共享容量</th></tr></thead>
+        <tbody>${rels.length ? rels.map(r => `
+          <tr style="cursor:pointer" data-bids='${esc(JSON.stringify(r.block_ids))}' data-other="${esc(r.other)}">
+            <td><span class="rel-badge ${r.kind}">${r.kind === "same" ? "✓ 完全相同" : "▴ 部分重叠"}</span></td>
+            <td class="mono small">${esc(r.other)}</td>
+            <td class="num right">${r.shared_blocks}</td>
+            <td class="num right">${fmtBytes(r.shared_bytes)}</td>
+          </tr>`).join("") : `<tr><td colspan="4" class="empty small">无共享关系</td></tr>`}</tbody>
+      </table></div>
+    </div>`,
+    hideCancel: true, okText: "关闭",
+  });
+  document.querySelectorAll(".modal-mask tbody tr[data-bids]").forEach(tr => {
+    tr.onclick = () => {
+      const bids = JSON.parse(tr.dataset.bids);
+      showSharedBlocksModal(bids, path, tr.dataset.other);
+    };
+  });
+  highlightNode(path);
+}
+
+// ------------------------------------------------------------------ 弹窗：关系边
+function showEdgeDetail(d, e, kind) {
+  modal({
+    title: kind === "same" ? "完全相同的文件对" : "部分重叠的文件对",
+    wide: true,
+    body: `<div style="font-size:13.5px">
+      <div class="mono small" style="color:var(--ok)">${esc(e.a)}</div>
+      <div class="mono small" style="color:var(--ok);margin:2px 0">${esc(e.b)}</div>
+      <div class="mini-kv" style="margin:8px 0">
+        <span class="k">关系判定</span><span>${kind === "same"
+          ? "内容哈希一致，块序列逐一相同 → <b>完全相同</b>"
+          : "仅部分块相同，整体内容不同 → <b>部分重叠（不判为相同）</b>"}</span>
+        <span class="k">共享块数</span><span>${e.shared_blocks} 块（A 共 ${e.a_blocks} 块 / B 共 ${e.b_blocks} 块）</span>
+        <span class="k">共享容量</span><span>${fmtBytes(e.shared_bytes)}</span>
+      </div>
+      <div class="card-title" style="font-size:13px">共享的具体块（点击反查）</div>
+      <div class="table-wrap"><table class="tbl"><thead><tr><th>块</th><th class="right">大小</th></tr></thead>
+        <tbody>${e.block_ids.map(bid => {
+          const b = d.shared_blocks.find(x => x.id === bid) || { size: 0 };
+          return `<tr style="cursor:pointer" data-bid="${esc(bid)}">
+            <td class="blk-cell">blk_${esc(blockShort({ id: bid }))}…</td>
+            <td class="num right">${fmtBytes(b.size)}</td></tr>`;
+        }).join("")}</tbody></table></div>
+    </div>`,
+    hideCancel: true, okText: "关闭",
+  });
+  document.querySelectorAll(".modal-mask tbody tr[data-bid]").forEach(tr => {
+    tr.onclick = () => openBlockDetail(tr.dataset.bid);
+  });
+}
+
+function showSharedBlocksModal(bids, a, b) {
+  modal({
+    title: `共享块 · ${a.split("/").pop()} ↔ ${b.split("/").pop()}`,
+    body: `<div class="table-wrap"><table class="tbl">
+      <thead><tr><th>块</th><th class="right">大小</th></tr></thead>
+      <tbody>${bids.map(bid => {
+        const blk = DATA.shared_blocks.find(x => x.id === bid) || { size: 0 };
+        return `<tr style="cursor:pointer" data-bid="${esc(bid)}">
+          <td class="blk-cell">blk_${esc(blockShort({ id: bid }))}…</td>
+          <td class="num right">${fmtBytes(blk.size)}</td></tr>`;
+      }).join("")}</tbody></table></div>
+      <div class="small muted" style="margin-top:8px">共 ${bids.length} 个块 · 点击行反查全部引用者</div>`,
+    hideCancel: true, okText: "关闭",
+  });
+  document.querySelectorAll(".modal-mask tbody tr[data-bid]").forEach(tr => {
+    tr.onclick = () => openBlockDetail(tr.dataset.bid);
+  });
+}
+
+// ------------------------------------------------------------------ 弹窗：块反查
+async function openBlockDetail(bid) {
+  let d;
+  try { d = await api("GET", `/api/dedup/block?id=${encodeURIComponent(bid)}`); }
+  catch (e) { toast("块查询失败：" + e.message, "bad"); return; }
+  const b = d.block;
+  const rows = (refs, tag) => refs.map(r =>
+    `<tr><td><span class="chip">${tag}</span></td>
+      <td class="mono small">${esc(r.path)}</td>
+      <td class="num small muted">${(r.indexes || []).map(i => "#" + i).join(", ")}</td></tr>`).join("");
+  modal({
+    title: "数据块引用反查",
+    wide: true,
+    body: `<div style="font-size:13.5px">
+      <div class="mini-kv">
+        <span class="k">块 ID</span><span class="mono">${esc(b.id)}</span>
+        <span class="k">校验和</span><span class="mono small">${esc(b.checksum)}</span>
+        <span class="k">大小 / 时间戳</span><span>${fmtBytes(b.size)} · genstamp ${b.genstamp}</span>
+        <span class="k">存活副本</span><span>${b.live_replicas} / 期望 ${b.desired}
+          ${b.replicas.map(r => `<span class="chip">${esc(r.node)}·${esc(r.state)}</span>`).join(" ")}</span>
+      </div>
+      <hr class="hr">
+      <div class="card-title" style="font-size:13px">活动文件（${d.active_refs.length}）</div>
+      <div class="table-wrap"><table class="tbl">
+        <thead><tr><th style="width:80px">来源</th><th>路径</th><th>块内序号</th></tr></thead>
+        <tbody>${rows(d.active_refs, "文件") || `<tr><td colspan="3" class="empty small">无</td></tr>`}</tbody>
+      </table></div>
+      ${d.version_refs.length ? `<hr class="hr">
+      <div class="card-title" style="font-size:13px">历史版本引用（${d.version_refs_total} 个提交，显示最近 ${d.version_refs.length}）</div>
+      <div class="table-wrap"><table class="tbl">
+        <thead><tr><th style="width:80px">提交</th><th>说明 / 路径</th><th>时间</th></tr></thead>
+        <tbody>${d.version_refs.map(v => `<tr>
+          <td class="mono small">${esc(v.short)}</td>
+          <td class="small">${esc(v.message)}<br><span class="muted mono">${esc(v.paths.join(", "))}</span></td>
+          <td class="small muted nowrap">${fmtTs(v.ts)}</td></tr>`).join("")}</tbody>
+      </table></div>` : ""}
+      ${d.trash_refs.length ? `<hr class="hr">
+      <div class="card-title" style="font-size:13px">回收站引用（${d.trash_refs.length}）</div>
+      <div class="table-wrap"><table class="tbl">
+        <thead><tr><th>回收站项</th><th>原路径</th></tr></thead>
+        <tbody>${d.trash_refs.map(r => `<tr>
+          <td class="small">${esc(r.name)}</td>
+          <td class="mono small muted">${esc(r.original_path)}</td></tr>`).join("")}</tbody>
+      </table></div>` : ""}
+    </div>`,
+    hideCancel: true, okText: "关闭",
+  });
+}
+
+// ------------------------------------------------------------------ 图高亮
+function highlightNode(path) {
+  if (!simState) return;
+  const linked = new Set([path]);
+  simState.graph.edges.forEach(e => {
+    if (e.source === path) linked.add(e.target);
+    if (e.target === path) linked.add(e.source);
+  });
+  simState.nodeEls.forEach((el, i) => {
+    const nd = simState.graph.nodes[i];
+    el.classList.toggle("dim", !linked.has(nd.id));
+    el.classList.toggle("hl", nd.id === path);
+  });
+  simState.edgeEls.forEach((el, i) => {
+    const e = simState.graph.edges[i];
+    el.classList.toggle("dim", e.source !== path && e.target !== path);
+    el.classList.toggle("hl", e.source === path || e.target === path);
+  });
+}
+
+// ------------------------------------------------------------------ 交互绑定
+document.getElementById("rel-seg").addEventListener("click", e => {
+  const btn = e.target.closest("button"); if (!btn) return;
+  relMode = btn.dataset.v;
+  document.querySelectorAll("#rel-seg button").forEach(x => x.classList.toggle("active", x === btn));
+  document.getElementById("rel-graph-wrap").style.display = relMode === "graph" ? "" : "none";
+  document.getElementById("rel-list-wrap").style.display = relMode === "list" ? "" : "none";
+});
+document.getElementById("f-seg").addEventListener("click", e => {
+  const btn = e.target.closest("button"); if (!btn) return;
+  fileFilter = btn.dataset.v;
+  document.querySelectorAll("#f-seg button").forEach(x => x.classList.toggle("active", x === btn));
+  renderFiles(DATA);
+});
+document.getElementById("blk-q").addEventListener("input", e => {
+  if (DATA) renderBlocks(DATA, e.target.value);
+});
+document.addEventListener("click", e => {
+  if (!e.target.closest?.(".dd-node")) {
+    if (simState) {
+      simState.nodeEls.forEach(el => el.classList.remove("dim", "hl"));
+      simState.edgeEls.forEach(el => el.classList.remove("dim", "hl"));
+    }
+  }
+});
+
+initPage("dedup.html", "内容去重").then(() => {
+  loadAll().catch(e => toast("加载失败：" + e.message, "bad"));
+  DFSVS.poll(() => DATA && api("GET", "/api/dedup/overview").then(d => {
+    DATA = d; renderKpis(d); renderSave(d); renderBackup(d);
+  }).catch(() => {}), 15000);
+});
+</script>
+</body>
+</html>

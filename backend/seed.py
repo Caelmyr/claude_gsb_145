@@ -321,6 +321,39 @@ def _big_log_file(lines=3000):
     return "\n".join(out) + "\n"
 
 
+def _aligned_prefix(blocks):
+    """恰好填满 blocks 个定长块（64KiB）的确定性前缀，用于构造共享块。"""
+    target = config.BLOCK_SIZE * blocks
+    out = bytearray()
+    i = 0
+    while len(out) < target:
+        out += (f"shared-chunk-prefix line {i:08d} ; "
+                f"two reports share this exact block\n").encode()
+        i += 1
+    return bytes(out[:target])
+
+
+RUNBOOK_MD = """# 运维操作手册（Runbook）
+
+## 1. 节点故障
+1. 在节点状态页确认节点状态为 DEAD；
+2. 观察 under-replicated 队列自动消化；
+3. 若 5 分钟未收敛，检查目标节点磁盘与网络。
+
+## 2. 副本损坏
+* 巡检（scrub）会标记校验和不符的副本；
+* NameNode 先摘除坏副本再触发再复制，保证队列可收敛。
+
+## 3. 容量告警
+* 查看存储统计页的容量水位与块分布；
+* 通过新增 DataNode 进程扩容（自动注册）。
+
+> 本手册在 /docs 与 /ops 各保存一份，内容完全一致，
+> 因此底层数据块全部共享（内容去重，只占一份物理空间）。
+"""
+
+
+
 # ----------------------------------------------------------------------------
 # 种子主流程
 # ----------------------------------------------------------------------------
@@ -359,10 +392,32 @@ def seed_cluster(nn, datanodes=None, verbose=True):
         "/public/notice.txt": (
             "本目录对全体用户开放只读。\n系统状态页: /nodes.html\n".encode(),
             "admin"),
+        # ---- 内容去重演示素材 ----
+        # 完全相同（单块）：公告在公共区与备份区各一份
+        "/public/notice-backup.txt": (
+            "本目录对全体用户开放只读。\n系统状态页: /nodes.html\n".encode(),
+            "admin"),
+        # 完全相同（多块）：运维手册两处存放，全部块共享
+        "/docs/runbook.md": (RUNBOOK_MD.encode(), "admin"),
+        "/ops/runbook-copy.md": (RUNBOOK_MD.encode(), "admin"),
+        # 部分重叠（单块共享 + 各自独有块）：两份月报共享同一段公共前缀，
+        # 但整体内容不同——只能判为"部分重叠"，不能误报为完全相同
+        "/data/monthly-2026-07.csv": (
+            _aligned_prefix(1)
+            + b"month,orders,revenue\n2026-07,4821,918233.50\n"
+            + os.urandom(40 * 1024),
+            "admin"),
+        "/data/monthly-2026-08.csv": (
+            _aligned_prefix(1)
+            + b"month,orders,revenue\n2026-08,5137,986420.12\n"
+            + os.urandom(40 * 1024),
+            "admin"),
     }
     # 大二进制文件（多块 + 全副本，撑出容量水位）
     big = os.urandom(config.SEED_RANDOM_FILE_SIZE)
     files_v1["/data/blob-3mb.bin"] = (big, "admin")
+    # 完全相同（多块大文件）：冷备份一份，块全部命中去重、零新增物理块
+    files_v1["/backup/blob-3mb-2026q3.bin"] = (big, "admin")
 
     for path, (data, author) in files_v1.items():
         nn.write_file_internal(path, data, author)
@@ -564,3 +619,71 @@ def _seed_logs(nn):
             })
         items.sort(key=lambda x: x["ts"])
         nn.meta.touch("logs")
+
+
+# ----------------------------------------------------------------------------
+# 去重演示素材（幂等补丁）
+# ----------------------------------------------------------------------------
+# 旧快照已带 seeded 标记时 seed_cluster 会整体跳过；该函数只在文件缺失时
+# 补写去重页所需的「完全相同 / 部分重叠」示例，不触碰版本树，可重复执行。
+
+DEDUP_DEMO_MARK = "dedup_demo_v1"
+
+
+def _file_exists(nn, path):
+    return nn.fs.resolve(path, must_exist=False) is not None
+
+
+def ensure_dedup_demo(nn, verbose=False):
+    def say(msg):
+        if verbose:
+            print(f"[seed] {msg}")
+
+    with nn.meta.lock:
+        cluster = nn.meta.get("cluster")
+        if cluster.get(DEDUP_DEMO_MARK):
+            return False
+
+    added = 0
+    # 完全相同（单块）：公告在公共区与备份区各一份
+    notice = ("本目录对全体用户开放只读。\n系统状态页: /nodes.html\n".encode())
+    pairs = [
+        ("/public/notice-backup.txt", notice),
+        ("/docs/runbook.md", RUNBOOK_MD.encode()),
+        ("/ops/runbook-copy.md", RUNBOOK_MD.encode()),
+    ]
+    for path, data in pairs:
+        if not _file_exists(nn, path):
+            nn.write_file_internal(path, data, "admin")
+            added += 1
+
+    # 部分重叠：两份月报共享恰好一个 64KiB 前缀块，其余内容各自不同
+    monthly = [
+        ("/data/monthly-2026-07.csv",
+         b"month,orders,revenue\n2026-07,4821,918233.50\n", 7),
+        ("/data/monthly-2026-08.csv",
+         b"month,orders,revenue\n2026-08,5137,986420.12\n", 8),
+    ]
+    for path, mid, seed in monthly:
+        if not _file_exists(nn, path):
+            rnd = random.Random(seed)
+            nn.write_file_internal(
+                path, _aligned_prefix(1) + mid + rnd.randbytes(40 * 1024),
+                "admin")
+            added += 1
+
+    # 完全相同（多块大文件）：若 blob-3mb.bin 已存在则做一份零新增物理块的冷备
+    if not _file_exists(nn, "/backup/blob-3mb-2026q3.bin"):
+        blob = nn.fs.resolve("/data/blob-3mb.bin", must_exist=False)
+        if blob is not None:
+            nn.write_file_internal(
+                "/backup/blob-3mb-2026q3.bin",
+                nn.read_blocks(blob.get("block_ids", [])), "admin")
+            added += 1
+
+    with nn.meta.lock:
+        nn.meta.get("cluster")[DEDUP_DEMO_MARK] = now()
+        nn.meta.touch("cluster")
+    if added:
+        say(f"补写去重演示素材 {added} 个文件")
+    return True

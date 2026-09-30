@@ -27,12 +27,12 @@ if __package__ in (None, ""):
     from backend import config
     from backend.namenode import NameNode
     from backend.datanode import DataNode
-    from backend.seed import seed_cluster, is_seeded
+    from backend.seed import (seed_cluster, is_seeded, ensure_dedup_demo)
 else:
     from . import config
     from .namenode import NameNode
     from .datanode import DataNode
-    from .seed import seed_cluster, is_seeded
+    from .seed import (seed_cluster, is_seeded, ensure_dedup_demo)
 
 
 BANNER = r"""
@@ -90,6 +90,9 @@ class Cluster:
         self.wait_ready()
         if self.seed and not is_seeded(self.nn):
             seed_cluster(self.nn, list(self.dns.values()), self.verbose)
+        if self.seed:
+            # 幂等：为旧快照补「内容去重」页的完全相同/部分重叠示例
+            ensure_dedup_demo(self.nn, self.verbose)
         self.nn.meta.flush()
         self._log("集群就绪 ✔")
 
